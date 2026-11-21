@@ -86,14 +86,34 @@ wallpaper-engine-repack --all /home/$USER/Pictures/Wallpapers/Unpacked -u unpack
 
 Each folder ends up with `project.json`, the preview and `scene.pkg`, the same files a Workshop wallpaper has, ready for a player like Waywallen. The original package header version is saved in `.pkg-version` while unpacking and reused automatically. `-u` must match the subfolder name used when unpacking; `unpacked-scenes` is also the default, so it can be left out.
 
-## Copying Video Wallpapers
+## Bulk Copying Video Wallpapers
 
 Video wallpapers are plain video files, not packages, so they don't need unpacking. `wallpaper-engine-copy-videos` gathers them all into one folder as `.mp4` files, ready for a player like Waywallen, and fixes badly encoded ones on the way:
 
 ```bash
-wallpaper-engine-copy-videos --dry-run                    # see what it would do
-wallpaper-engine-copy-videos -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos
-wallpaper-engine-copy-videos -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos --1080p
+WS=~/.local/share/Steam/steamapps/workshop/content/431960
+
+# 1. Preview what it would do with each video
+wallpaper-engine-copy-videos "$WS" -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos --dry-run
+
+# 2. Copy (and optimize) them all
+wallpaper-engine-copy-videos "$WS" -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos
+
+# Or also shrink anything larger than 1080p
+wallpaper-engine-copy-videos "$WS" -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos --1080p
+```
+
+Use the Workshop folder for your Steam install from the [table above](#bulk-unpacking), or leave `"$WS"` out and it searches the usual locations itself. To gather videos from several Steam libraries at once, list each Workshop folder:
+
+```bash
+wallpaper-engine-copy-videos "$WS" /mnt/games/SteamLibrary/steamapps/workshop/content/431960 \
+  -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos
+```
+
+After subscribing to new wallpapers, run the same command again; only the new videos are processed. To redo every video, for example to apply `--1080p` to ones copied before, add `--overwrite`:
+
+```bash
+wallpaper-engine-copy-videos "$WS" -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos --1080p --overwrite
 ```
 
 Each video is checked with `ffprobe`, and only what needs fixing gets fixed:
