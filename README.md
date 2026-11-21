@@ -6,7 +6,8 @@ Command-line tools for unpacking, editing and repacking Wallpaper Engine scene w
 | --- | --- |
 | `wallpaper-engine-unpack` | Extracts `.pkg` files and converts `.tex` textures to PNG/JPG/GIF/MP4. A Python port of [RePKG](https://github.com/notscuffed/repkg). |
 | `wallpaper-engine-repack` | Packs an extracted folder back into a `scene.pkg`. |
-| `wallpaper-engine-copy-videos` | Copies every video wallpaper from the Workshop into one folder, named by title, re-encoding badly encoded ones and optionally shrinking them to 1080p. |
+| `wallpaper-engine-copy-videos` | Copies every video wallpaper from the Workshop into one folder, named by title, exactly as it is. |
+| `wallpaper-engine-copy-videos-optimized` | The same, but as MP4, re-encoding badly encoded videos and optionally shrinking them to 1080p. |
 | `wallpaper-engine-thumbnail-generator` | Makes a thumbnail (1920×1080 by default) named after the `project.json` title and points `"preview"` at it. |
 
 ## Install
@@ -88,35 +89,43 @@ Each folder ends up with `project.json`, the preview and `scene.pkg`, the same f
 
 ## Bulk Copying Video Wallpapers
 
-Video wallpapers are plain video files, not packages, so they don't need unpacking. `wallpaper-engine-copy-videos` gathers them all into one folder as `.mp4` files, ready for a player like Waywallen, and fixes badly encoded ones on the way:
+Video wallpapers are plain video files, not packages, so they don't need unpacking. Two commands gather them all into one folder, ready for a player like Waywallen:
+
+* `wallpaper-engine-copy-videos` copies every video exactly as it is. Fast, and needs nothing but Python.
+* `wallpaper-engine-copy-videos-optimized` saves them as MP4 and fixes badly encoded ones on the way (see [Optimizing](#optimizing)). It needs `ffmpeg`.
+
+Both name each video after its wallpaper's title, such as `Rainy Night.mp4`, adding the Workshop ID when two titles match.
 
 ```bash
 WS=~/.local/share/Steam/steamapps/workshop/content/431960
 
-# 1. Preview what it would do with each video
+# Preview, then copy every video unchanged
 wallpaper-engine-copy-videos "$WS" -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos --dry-run
-
-# 2. Copy (and optimize) them all
 wallpaper-engine-copy-videos "$WS" -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos
 
-# Or also shrink anything larger than 1080p
-wallpaper-engine-copy-videos "$WS" -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos --1080p
+# Or preview, then copy and optimize them, also shrinking anything larger than 1080p
+wallpaper-engine-copy-videos-optimized "$WS" -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos --1080p --dry-run
+wallpaper-engine-copy-videos-optimized "$WS" -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos --1080p
 ```
 
-Use the Workshop folder for your Steam install from the [table above](#bulk-unpacking), or leave `"$WS"` out and it searches the usual locations itself. To gather videos from several Steam libraries at once, list each Workshop folder:
+Use the Workshop folder for your Steam install from the [table above](#bulk-unpacking), or leave `"$WS"` out and it searches the usual locations itself (native, Debian/Ubuntu and Flatpak). To gather videos from several Steam libraries at once, list each Workshop folder:
 
 ```bash
 wallpaper-engine-copy-videos "$WS" /mnt/games/SteamLibrary/steamapps/workshop/content/431960 \
   -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos
 ```
 
-After subscribing to new wallpapers, run the same command again; only the new videos are processed. To redo every video, for example to apply `--1080p` to ones copied before, add `--overwrite`:
+After subscribing to new wallpapers, run the same command again; only the new videos are processed. `--overwrite` redoes the ones already there, for example to optimize videos you first copied unchanged:
 
 ```bash
-wallpaper-engine-copy-videos "$WS" -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos --1080p --overwrite
+wallpaper-engine-copy-videos-optimized "$WS" -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos --1080p --overwrite
 ```
 
-Each video is checked with `ffprobe`, and only what needs fixing gets fixed:
+Copying unchanged keeps each video's original extension (`.mp4`, `.webm`, ...), while optimizing always writes `.mp4`. If you switch from one to the other, delete the old copies of any non-MP4 videos.
+
+### Optimizing
+
+`wallpaper-engine-copy-videos-optimized` checks each video with `ffprobe` and only fixes what needs fixing:
 
 | Problem | What happens |
 | --- | --- |
@@ -129,11 +138,8 @@ Each video is checked with `ffprobe`, and only what needs fixing gets fixed:
 | Not an MP4, or not "fast start" | Remuxed into a fast-start MP4, without re-encoding |
 | Nothing wrong | Copied as is |
 
-* With no folder given, it finds the Workshop folder in the usual Steam locations (native, Debian/Ubuntu and Flatpak). Give one or more Workshop folders to choose.
-* Each video is named after its wallpaper's title, such as `Rainy Night.mp4`; when two titles match, the Workshop ID is added.
 * Re-encodes use H.264 at `--crf 18` (lower is higher quality) with `--preset veryfast`; a slower preset such as `slow` makes smaller files but takes longer. Audio is kept, or converted to AAC if MP4 can't hold it.
 * A codec conversion can make a file slightly larger (VP9 and HEVC compress better than H.264), but H.264 is far lighter to play, which matters most on GPUs without hardware video decoding.
-* Running it again only processes new videos. `--overwrite` redoes the ones already there, for example to apply `--1080p` later. `--no-optimize` copies everything exactly as it is.
 * Needs `ffmpeg` and `ffprobe` with the `libx264` encoder (on Fedora, the full `ffmpeg` package from RPM Fusion).
 
 ## License

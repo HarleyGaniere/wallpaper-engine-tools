@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 HarleyGaniere
-"""Copy the video wallpapers from a Wallpaper Engine Workshop folder into one
-folder, optimizing badly encoded ones along the way.
+"""Copy the video wallpapers from a Wallpaper Engine Workshop folder into one folder.
 
-Usage:
-    wallpaper-engine-copy-videos [workshop_folder ...] [-o output_folder]
-                                 [--1080p] [--no-optimize] [--dry-run]
+This one file provides two commands; which one runs depends on the name it
+is called by:
 
-Finds every wallpaper whose project.json says "type": "video" and puts its
-video in the output folder as an .mp4 named after the wallpaper's title
-("Rainy Night.mp4"; the Workshop ID is added when two titles match).
+    wallpaper-engine-copy-videos [workshop_folder ...] [-o output_folder] [--dry-run]
+        Copies every video exactly as it is. No ffmpeg needed.
 
-Each video is checked with ffprobe and only re-encoded when something is
+    wallpaper-engine-copy-videos-optimized [workshop_folder ...] [-o output_folder]
+                                           [--1080p] [--crf N] [--preset P] [--dry-run]
+        Copies them as MP4, optimizing badly encoded ones along the way.
+
+Both find every wallpaper whose project.json says "type": "video" and name
+its video after the wallpaper's title ("Rainy Night.mp4"; the Workshop ID is
+added when two titles match).
+
+With -optimized, each video is checked with ffprobe and only re-encoded when something is
 actually wrong with it for wallpaper playback:
   * a codec that is heavy to decode (HEVC, VP9, AV1, ...) instead of H.264
   * 10-bit or 4:2:2 / 4:4:4 color, which many decoders handle poorly
@@ -27,8 +32,8 @@ original, when the only problem was bitrate, is thrown away.
 
 Without a workshop folder it looks in the usual Steam locations (native,
 Debian/Ubuntu and Flatpak). The default output is
-~/Pictures/Wallpapers/WallpaperEngineVideos. Needs ffmpeg and ffprobe unless
---no-optimize is used.
+~/Pictures/Wallpapers/WallpaperEngineVideos. The -optimized command needs
+ffmpeg and ffprobe.
 """
 import argparse
 import json
@@ -292,34 +297,36 @@ def process(src, dest, a):
 
 
 def main():
+    prog = os.path.basename(sys.argv[0])
+    optimized = prog.endswith("-optimized")
     ap = argparse.ArgumentParser(
-        prog=os.path.basename(sys.argv[0]),
-        description="Copy Wallpaper Engine video wallpapers into one folder, "
-                    "optimizing badly encoded ones.")
+        prog=prog,
+        description=("Copy Wallpaper Engine video wallpapers into one folder as MP4, "
+                     "optimizing badly encoded ones." if optimized else
+                     "Copy Wallpaper Engine video wallpapers into one folder, unchanged."))
     ap.add_argument("workshop", nargs="*",
                     help="Workshop folder(s) (.../steamapps/workshop/content/431960); "
                          "default: search the usual Steam locations")
     ap.add_argument("-o", "--output", default=DEFAULT_OUTPUT,
                     help=f"destination folder (default {DEFAULT_OUTPUT})")
-    ap.add_argument("--1080p", dest="hd", action="store_true",
-                    help="also shrink videos larger than 1920x1080 to 1080p")
-    ap.add_argument("--no-optimize", dest="optimize", action="store_false",
-                    help="copy every video exactly as it is")
-    ap.add_argument("--crf", type=int, default=18,
-                    help="H.264 quality for re-encodes, lower is better (default 18)")
-    ap.add_argument("--preset", default="veryfast",
-                    help="x264 preset for re-encodes; slower = smaller files (default veryfast)")
+    if optimized:
+        ap.add_argument("--1080p", dest="hd", action="store_true",
+                        help="also shrink videos larger than 1920x1080 to 1080p")
+        ap.add_argument("--crf", type=int, default=18,
+                        help="H.264 quality for re-encodes, lower is better (default 18)")
+        ap.add_argument("--preset", default="veryfast",
+                        help="x264 preset for re-encodes; slower = smaller files (default veryfast)")
     ap.add_argument("--overwrite", action="store_true",
                     help="redo videos that are already in the output folder")
     ap.add_argument("--dry-run", action="store_true",
                     help="show what would be done without writing anything")
     a = ap.parse_args()
+    a.optimize = optimized
+    a.hd = getattr(a, "hd", False)
 
-    if a.hd:
-        a.optimize = True
     if a.optimize and not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
-        sys.exit("Optimizing needs ffmpeg and ffprobe. Install ffmpeg, "
-                 "or use --no-optimize to copy the videos as they are.")
+        sys.exit("Optimizing needs ffmpeg and ffprobe. Install ffmpeg, or use "
+                 "wallpaper-engine-copy-videos to copy the videos as they are.")
 
     workshops = a.workshop or find_workshop_folders()
     if not workshops:
