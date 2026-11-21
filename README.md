@@ -19,20 +19,22 @@ Needs Python 3 and Pillow (`python3-pillow`). `python3-lz4` is optional and spee
 ## Usage
 
 ```bash
-# Unpack (extract is the default command)
-wallpaper-engine-unpack scene.pkg -o output -c
+# Unpack into my-wallpaper/unpacked-scenes/, with project.json and the preview in my-wallpaper/
+wallpaper-engine-unpack scene.pkg -o my-wallpaper -c -u unpacked-scenes
 wallpaper-engine-unpack info scene.pkg -e
 
-# Edit files in output/, then repack
-wallpaper-engine-repack output scene.pkg --like original/scene.pkg
+# Edit files in my-wallpaper/unpacked-scenes/, then rebuild my-wallpaper/scene.pkg
+wallpaper-engine-repack my-wallpaper -u unpacked-scenes
 
 # Thumbnail from the wallpaper's own art, any image, or a screenshot
-wallpaper-engine-thumbnail-generator <wallpaper-folder> --from-extracted output
-wallpaper-engine-thumbnail-generator <wallpaper-folder> --from picture.png --size 2560x1440
-wallpaper-engine-thumbnail-generator <wallpaper-folder> --screenshot --delay 5
+wallpaper-engine-thumbnail-generator my-wallpaper --from-extracted my-wallpaper/unpacked-scenes
+wallpaper-engine-thumbnail-generator my-wallpaper --from picture.png --size 2560x1440
+wallpaper-engine-thumbnail-generator my-wallpaper --screenshot --delay 5
 ```
 
-`--like` copies the version header from the original package; without it a generic `PKGV0001` header is used.
+`extract` is the default command, so it can be left out. The original package header version is saved in `my-wallpaper/.pkg-version` and reused when repacking.
+
+To pack any extracted folder into a `.pkg` of your choosing instead, give both paths: `wallpaper-engine-repack extracted-folder out.pkg --like original/scene.pkg`. `--like` copies the version header from the original package; without it a generic `PKGV0001` header is used.
 
 ## Bulk Unpacking
 
@@ -77,11 +79,11 @@ Check the space first: `du -sh "$WS"`. The unpacked copy is roughly that size ag
 After editing, rebuild `scene.pkg` next to `project.json` in one wallpaper folder, or in all of them:
 
 ```bash
-wallpaper-engine-repack ~/wallpapers/unpacked/"Wallpaper Title"
-wallpaper-engine-repack --all ~/wallpapers/unpacked
+wallpaper-engine-repack ~/wallpapers/unpacked/"Wallpaper Title" -u unpacked-scenes
+wallpaper-engine-repack --all ~/wallpapers/unpacked -u unpacked-scenes
 ```
 
-Each folder ends up with `project.json`, the preview and `scene.pkg`, the same files a Workshop wallpaper has, ready for a player like Waywallen. The original package header version is saved in `.pkg-version` while unpacking and reused automatically. Use `-u NAME` if you unpacked into a subfolder other than `unpacked-scenes`.
+Each folder ends up with `project.json`, the preview and `scene.pkg`, the same files a Workshop wallpaper has, ready for a player like Waywallen. The original package header version is saved in `.pkg-version` while unpacking and reused automatically. `-u` must match the subfolder name used when unpacking; `unpacked-scenes` is also the default, so it can be left out.
 
 ## License
 
