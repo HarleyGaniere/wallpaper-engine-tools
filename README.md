@@ -34,6 +34,10 @@ wallpaper-engine-thumbnail-generator <wallpaper-folder> --screenshot --delay 5
 
 `--like` copies the version header from the original package; without it a generic `PKGV0001` header is used.
 
-## Credits
+## License
 
-`wallpaper-engine-unpack` is based on RePKG by notscuffed, used under the MIT License (see `LICENSE.RePKG`).
+Copyright (C) 2026 HarleyGaniere
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. See [`LICENSE`](LICENSE) for the full text.
+
+`wallpaper-engine-unpack` is based on RePKG by notscuffed, whose MIT License notice is kept in [`LICENSE.RePKG`](LICENSE.RePKG).

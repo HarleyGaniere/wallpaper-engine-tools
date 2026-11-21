@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 HarleyGaniere
+# Based on RePKG, Copyright (c) 2019 notscuffed, MIT License (see LICENSE.RePKG)
 """wallpaper-engine-unpack: a Python port of RePKG (github.com/notscuffed/repkg).
 
 Extracts Wallpaper Engine .pkg files and converts .tex textures into normal
