@@ -7,7 +7,7 @@ Command-line tools for unpacking, editing and repacking Wallpaper Engine scene w
 | `wallpaper-engine-unpack` | Extracts `.pkg` files and converts `.tex` textures to PNG/JPG/GIF/MP4. A Python port of [RePKG](https://github.com/notscuffed/repkg). |
 | `wallpaper-engine-repack` | Packs an extracted folder back into a `scene.pkg`. |
 | `wallpaper-engine-copy-videos` | Copies every video wallpaper from the Workshop into one folder, named by title, exactly as it is. |
-| `wallpaper-engine-copy-videos-optimized` | The same, but as MP4, re-encoding badly encoded videos and optionally shrinking them to 1080p. |
+| `wallpaper-engine-copy-videos-optimized` | The same, but as MP4, re-encoding badly encoded videos, with options to cap the resolution or convert to HEVC. |
 | `wallpaper-engine-thumbnail-generator` | Makes a thumbnail (1920×1080 by default) named after the `project.json` title and points `"preview"` at it. |
 
 ## Install
@@ -129,18 +129,43 @@ Copying unchanged keeps each video's original extension (`.mp4`, `.webm`, ...), 
 
 | Problem | What happens |
 | --- | --- |
-| HEVC, VP9, AV1 or another codec that is heavy to decode | Re-encoded to H.264 |
+| A codec other than the target (H.264, or HEVC with `--hevc`) | Re-encoded to the target |
 | 10-bit or 4:2:2 / 4:4:4 color | Re-encoded to standard 8-bit 4:2:0 |
 | Bitrate far above what the resolution needs | Re-encoded; if that doesn't make it smaller, the original is kept |
 | More than 60 frames per second | Re-encoded at 60 fps |
 | Interlaced | Deinterlaced and re-encoded |
-| Larger than 1920×1080 | Shrunk to 1080p, **only with `--1080p`** |
+| Larger than the `--1080p` / `--1440p` / `--4k` limit | Shrunk to fit, keeping its shape |
 | Not an MP4, or not "fast start" | Remuxed into a fast-start MP4, without re-encoding |
 | Nothing wrong | Copied as is |
 
-* Re-encodes use H.264 at `--crf 18` (lower is higher quality) with `--preset veryfast`; a slower preset such as `slow` makes smaller files but takes longer. Audio is kept, or converted to AAC if MP4 can't hold it.
-* A codec conversion can make a file slightly larger (VP9 and HEVC compress better than H.264), but H.264 is far lighter to play, which matters most on GPUs without hardware video decoding.
-* Needs `ffmpeg` and `ffprobe` with the `libx264` encoder (on Fedora, the full `ffmpeg` package from RPM Fusion).
+#### Options
+
+| Option | What it does |
+| --- | --- |
+| `--1080p`, `--1440p`, `--4k` | Shrink anything larger than 1920×1080, 2560×1440 or 3840×2160 to fit. Smaller videos are left alone, never upscaled, since upscaling adds no detail and only makes files bigger and heavier to play. Ultrawide and other shapes are scaled to fit, not cropped. Pick one. |
+| `--hevc` | Encode to HEVC (H.265) instead of H.264. Files are typically 30–50% smaller at the same quality, but HEVC is much heavier to play on GPUs without hardware HEVC decoding. Converting H.264 to HEVC is done only when it actually saves space. |
+| `--only-bloated` | Re-encode only videos whose bitrate is far too high, and copy everything else unchanged: no codec conversion, no remuxing. Combines with `--hevc` and the resolution limits. |
+| `--crf N` | Quality of re-encodes: lower means better quality and bigger files. Defaults are 18 for H.264 and 22 for HEVC, both close to visually lossless. Around 23 (H.264) or 26 (HEVC) gives noticeably smaller files with a small quality loss. |
+| `--preset P` | Encoding speed: `veryfast` (default), `fast`, `medium`, `slow`, `slower`. Slower presets make smaller files at the same quality, but take much longer. |
+
+Examples:
+
+```bash
+# Fix only the bloated files, nothing else
+wallpaper-engine-copy-videos-optimized "$WS" --only-bloated
+
+# Keep everything at most 4K
+wallpaper-engine-copy-videos-optimized "$WS" --4k
+
+# Smallest files: HEVC, capped at 1080p, slower preset
+wallpaper-engine-copy-videos-optimized "$WS" --hevc --1080p --preset slow
+```
+
+**What counts as bloated:** the bitrate is compared with the video's resolution and frame rate (bits per pixel per frame). A well-made H.264 wallpaper sits around 0.05–0.15, and HEVC around half that, so files are flagged at roughly 2–3× the size they need to be: above 0.30 for H.264 (about 19 Mb/s, or 140 MB a minute, at 1080p30; about 75 Mb/s at 4K30) and above 0.15 for HEVC and VP9. A very large file that is long, high-resolution and still within that range is simply a big video, not a bloated one.
+
+* A codec conversion to H.264 can make a file slightly larger (VP9 and HEVC compress better), but H.264 is far lighter to play, which matters most on GPUs without hardware video decoding. Audio is kept, or converted to AAC if MP4 can't hold it.
+* Each video's size before and after is shown, with a total at the end.
+* Needs `ffmpeg` and `ffprobe` with the `libx264` encoder, and `libx265` for `--hevc` (on Fedora, the full `ffmpeg` package from RPM Fusion).
 
 ## License
 

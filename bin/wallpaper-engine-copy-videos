@@ -10,25 +10,30 @@ is called by:
         Copies every video exactly as it is. No ffmpeg needed.
 
     wallpaper-engine-copy-videos-optimized [workshop_folder ...] [-o output_folder]
-                                           [--1080p] [--crf N] [--preset P] [--dry-run]
+            [--1080p | --1440p | --4k] [--hevc] [--only-bloated]
+            [--crf N] [--preset P] [--dry-run]
         Copies them as MP4, optimizing badly encoded ones along the way.
 
 Both find every wallpaper whose project.json says "type": "video" and name
 its video after the wallpaper's title ("Rainy Night.mp4"; the Workshop ID is
 added when two titles match).
 
-With -optimized, each video is checked with ffprobe and only re-encoded when something is
-actually wrong with it for wallpaper playback:
-  * a codec that is heavy to decode (HEVC, VP9, AV1, ...) instead of H.264
+With -optimized, each video is checked with ffprobe and only re-encoded
+(to H.264, or HEVC with --hevc) when something is wrong with it:
+  * a codec that isn't the target codec
   * 10-bit or 4:2:2 / 4:4:4 color, which many decoders handle poorly
-  * a bitrate far higher than the resolution needs (bloated file)
+  * a bitrate far higher than the resolution needs (see BLOATED_BPP)
   * more than 60 frames per second
   * interlaced video
-  * larger than 1920x1080, only when --1080p is given
-Videos that are fine but not "fast start" (index at the end) or not in an MP4
-container are remuxed without re-encoding, which is lossless and quick.
-Everything else is copied as is. A re-encode that comes out larger than the
-original, when the only problem was bitrate, is thrown away.
+  * larger than the --1080p / --1440p / --4k limit, if one is given
+    (shrunk to fit, keeping its shape; smaller videos are never upscaled)
+Videos that are fine but not "fast start" or not MP4 are remuxed without
+re-encoding. Everything else is copied as is. When a re-encode is only about
+saving space (a bloated bitrate, or H.264 to HEVC) and doesn't come out
+smaller, the original is kept.
+
+--only-bloated re-encodes nothing but bloated videos (plus the resolution
+limit, if given) and copies everything else unchanged.
 
 Without a workshop folder it looks in the usual Steam locations (native,
 Debian/Ubuntu and Flatpak). The default output is
@@ -55,9 +60,18 @@ STEAM_ROOTS = [
 DEFAULT_OUTPUT = "~/Pictures/Wallpapers/WallpaperEngineVideos"
 
 MAX_FPS = 60
-# Bits per pixel per frame. Well-made H.264 wallpapers sit around 0.05-0.15;
-# above this the file is far bigger (and slower to decode) than it needs to be.
-BLOATED_BPP = 0.30
+# "Bloated" thresholds in bits per pixel per frame (bitrate / (width x height x fps)).
+# A good H.264 encode of a wallpaper sits around 0.05-0.15 and HEVC around half
+# that, so these flag files at roughly 2-3x the size they need to be: about
+# 19 Mb/s (140 MB a minute) for 1080p30 H.264, or 75 Mb/s for 4K30.
+BLOATED_BPP = {"h264": 0.30, "hevc": 0.15, "vp9": 0.15, "av1": 0.10}
+BLOATED_BPP_OTHER = 0.30
+RESOLUTIONS = {"1080p": (1920, 1080), "1440p": (2560, 1440), "4k": (3840, 2160)}
+ENCODERS = {
+    # codec: (ffmpeg encoder, default CRF, extra args)
+    "h264": ("libx264", 18, ["-profile:v", "high"]),
+    "hevc": ("libx265", 22, ["-tag:v", "hvc1", "-x265-params", "log-level=error"]),
+}
 GOOD_PIX_FMTS = {"yuv420p", "yuvj420p"}
 MP4_AUDIO = {"aac", "mp3", "ac3", "eac3", "alac", "opus", "flac"}
 
@@ -159,8 +173,8 @@ class Plan:
     def __init__(self):
         self.reencode = []   # reasons that need a re-encode
         self.remux = []      # reasons fixed by remuxing alone
-        self.only_bitrate = False
-        self.scale = False
+        self.optional_only = False  # every reason is only about saving space
+        self.scale = None    # (max_width, max_height) to fit within
         self.fps_cap = False
         self.deinterlace = False
         self.copy_audio = True
@@ -168,7 +182,8 @@ class Plan:
         self.summary = ""
 
 
-def plan_for(path, info, want_1080p):
+def plan_for(path, info, opts):
+    """opts: .codec ("h264"/"hevc"), .max_res (w, h) or None, .only_bloated"""
     p = Plan()
     streams = info.get("streams", [])
     video = next((s for s in streams if s.get("codec_type") == "video"
@@ -186,37 +201,45 @@ def plan_for(path, info, want_1080p):
     bitrate = float(rate) if rate and str(rate).isdigit() else 0.0
     p.summary = f"{codec} {w}x{h} {fps:.0f}fps {pix} {bitrate / 1e6:.1f} Mb/s"
 
-    if codec != "h264":
-        p.reencode.append(f"{codec} codec")
-    if pix and pix not in GOOD_PIX_FMTS:
-        p.reencode.append(f"{pix} color")
-    if fps > MAX_FPS + 0.5:
-        p.reencode.append(f"{fps:.0f} fps")
-        p.fps_cap = True
-    if video.get("field_order") not in (None, "", "progressive", "unknown"):
-        p.reencode.append("interlaced")
-        p.deinterlace = True
-    if want_1080p and (w > 1920 or h > 1080):
-        p.reencode.append(f"{w}x{h} > 1080p")
-        p.scale = True
+    bloated = False
     if w and h and fps and bitrate:
         bpp = bitrate / (w * h * min(fps, MAX_FPS))
-        if bpp > BLOATED_BPP:
-            p.reencode.append(f"bloated ({bitrate / 1e6:.0f} Mb/s)")
-            p.only_bitrate = len(p.reencode) == 1
+        bloated = bpp > BLOATED_BPP.get(codec, BLOATED_BPP_OTHER)
+
+    optional = 0   # reasons that are only about file size
+    if not opts.only_bloated:
+        if codec != opts.codec:
+            p.reencode.append(f"{codec} codec")
+            # To H.264 it's for easier playback (keep it); to HEVC it's for size
+            optional += opts.codec == "hevc" and codec == "h264"
+        if pix and pix not in GOOD_PIX_FMTS:
+            p.reencode.append(f"{pix} color")
+        if fps > MAX_FPS + 0.5:
+            p.reencode.append(f"{fps:.0f} fps")
+            p.fps_cap = True
+        if video.get("field_order") not in (None, "", "progressive", "unknown"):
+            p.reencode.append("interlaced")
+            p.deinterlace = True
+    if opts.max_res and (w > opts.max_res[0] or h > opts.max_res[1]):
+        p.reencode.append(f"{w}x{h} > {opts.max_res[0]}x{opts.max_res[1]}")
+        p.scale = opts.max_res
+    if bloated:
+        p.reencode.append(f"bloated ({bitrate / 1e6:.0f} Mb/s)")
+        optional += 1
+    p.optional_only = bool(p.reencode) and optional == len(p.reencode)
 
     if audio is not None:
         p.has_audio = True
         p.copy_audio = audio.get("codec_name") in MP4_AUDIO
 
-    fmt = info.get("format", {}).get("format_name", "")
-    if "mp4" not in fmt and "mov" not in fmt:
-        p.remux.append("not an MP4 file")
-    elif not is_faststart(path):
-        p.remux.append("not fast-start")
-    if p.has_audio and not p.copy_audio:
-        p.remux.append(f"{audio.get('codec_name')} audio")
-        p.copy_audio = False
+    if not opts.only_bloated:
+        fmt = info.get("format", {}).get("format_name", "")
+        if "mp4" not in fmt and "mov" not in fmt:
+            p.remux.append("not an MP4 file")
+        elif not is_faststart(path):
+            p.remux.append("not fast-start")
+        if p.has_audio and not p.copy_audio:
+            p.remux.append(f"{audio.get('codec_name')} audio")
     return p
 
 
@@ -246,54 +269,57 @@ def remux(src, dest, plan):
                        *audio_args(plan), "-movflags", "+faststart"], dest)
 
 
-def reencode(src, dest, plan, crf, preset):
+def reencode(src, dest, plan, opts):
+    encoder, default_crf, extra = ENCODERS[opts.codec]
+    crf = opts.crf if opts.crf is not None else default_crf
     filters = []
     if plan.deinterlace:
         filters.append("bwdif")
     if plan.fps_cap:
         filters.append(f"fps={MAX_FPS}")
     if plan.scale:
-        filters.append("scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080")
+        mw, mh = plan.scale
+        # Fit inside the box, keeping the aspect ratio (no cropping)
+        filters.append(f"scale={mw}:{mh}:force_original_aspect_ratio=decrease:"
+                       "force_divisible_by=2")
     filters.append("format=yuv420p")
     return run_ffmpeg(["-i", src, "-map", "0:v:0", "-map", "0:a:0?",
                        "-vf", ",".join(filters),
-                       "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
-                       "-profile:v", "high", "-pix_fmt", "yuv420p",
+                       "-c:v", encoder, "-preset", opts.preset, "-crf", str(crf),
+                       *extra, "-pix_fmt", "yuv420p",
                        *audio_args(plan), "-movflags", "+faststart"], dest)
 
 
-def process(src, dest, a):
+def process(src, dest, plan, opts):
     """Returns a short description of what was done."""
-    if not a.optimize:
+    if plan is None:
         shutil.copy2(src, dest)
         return "copied"
 
-    info = probe(src)
-    if info is None:
-        shutil.copy2(src, dest)
-        return "copied (ffprobe couldn't read it)"
-    plan = plan_for(src, info, a.hd)
-
     note = ""
     if plan.reencode:
-        tmp = reencode(src, dest, plan, a.crf, a.preset)
-        if plan.only_bitrate and os.path.getsize(tmp) >= os.path.getsize(src):
-            os.remove(tmp)  # re-encoding didn't help; fall back to the original
-            note = " (re-encode wasn't smaller, kept the original)"
+        tmp = reencode(src, dest, plan, opts)
+        if plan.optional_only and os.path.getsize(tmp) >= os.path.getsize(src):
+            # The re-encode was only meant to save space and didn't; keep the original
+            os.remove(tmp)
+            note = f" ({opts.codec.upper()} re-encode wasn't smaller, kept the original)"
         else:
             os.replace(tmp, dest)
-            return f"re-encoded: {', '.join(plan.reencode)} [{plan.summary}]"
+            return f"re-encoded to {opts.codec.upper()}: {', '.join(plan.reencode)} [{plan.summary}]"
 
     if plan.remux:
         os.replace(remux(src, dest, plan), dest)
         return f"remuxed: {', '.join(plan.remux)}{note}"
 
-    if note:
-        shutil.copy2(src, dest)
-        return "copied" + note
-
     shutil.copy2(src, dest)
-    return "copied (already well encoded)"
+    return "copied" + (note or " (already well encoded)")
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
 
 
 def main():
@@ -310,23 +336,46 @@ def main():
     ap.add_argument("-o", "--output", default=DEFAULT_OUTPUT,
                     help=f"destination folder (default {DEFAULT_OUTPUT})")
     if optimized:
-        ap.add_argument("--1080p", dest="hd", action="store_true",
-                        help="also shrink videos larger than 1920x1080 to 1080p")
-        ap.add_argument("--crf", type=int, default=18,
-                        help="H.264 quality for re-encodes, lower is better (default 18)")
+        size = ap.add_mutually_exclusive_group()
+        size.add_argument("--1080p", dest="max_res", action="store_const", const="1080p",
+                          help="shrink videos larger than 1920x1080 to fit 1080p")
+        size.add_argument("--1440p", dest="max_res", action="store_const", const="1440p",
+                          help="shrink videos larger than 2560x1440 to fit 1440p")
+        size.add_argument("--4k", "--4K", dest="max_res", action="store_const", const="4k",
+                          help="shrink videos larger than 3840x2160 to fit 4K")
+        ap.add_argument("--hevc", "--HEVC", action="store_true",
+                        help="encode to HEVC (H.265) instead of H.264: much smaller files, "
+                             "but heavier to play without hardware HEVC decoding")
+        ap.add_argument("--only-bloated", action="store_true",
+                        help="only re-encode videos whose bitrate is far too high; "
+                             "copy everything else unchanged")
+        ap.add_argument("--crf", type=int, default=None,
+                        help="quality: lower = better and bigger "
+                             "(default 18 for H.264, 22 for HEVC)")
         ap.add_argument("--preset", default="veryfast",
-                        help="x264 preset for re-encodes; slower = smaller files (default veryfast)")
+                        help="encoder speed: slower presets (medium, slow) make smaller "
+                             "files at the same quality but take longer (default veryfast)")
     ap.add_argument("--overwrite", action="store_true",
                     help="redo videos that are already in the output folder")
     ap.add_argument("--dry-run", action="store_true",
                     help="show what would be done without writing anything")
     a = ap.parse_args()
-    a.optimize = optimized
-    a.hd = getattr(a, "hd", False)
+    a.codec = "hevc" if getattr(a, "hevc", False) else "h264"
+    a.max_res = RESOLUTIONS.get(getattr(a, "max_res", None) or "")
+    a.only_bloated = getattr(a, "only_bloated", False)
+    a.crf = getattr(a, "crf", None)
+    a.preset = getattr(a, "preset", "veryfast")
 
-    if a.optimize and not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
-        sys.exit("Optimizing needs ffmpeg and ffprobe. Install ffmpeg, or use "
-                 "wallpaper-engine-copy-videos to copy the videos as they are.")
+    if optimized:
+        if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+            sys.exit("Optimizing needs ffmpeg and ffprobe. Install ffmpeg, or use "
+                     "wallpaper-engine-copy-videos to copy the videos as they are.")
+        encoder = ENCODERS[a.codec][0]
+        encoders = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                                  capture_output=True, text=True).stdout
+        if encoder not in encoders:
+            sys.exit(f"Your ffmpeg has no {encoder} encoder. On Fedora, install the full "
+                     "ffmpeg from RPM Fusion: sudo dnf swap ffmpeg-free ffmpeg --allowerasing")
 
     workshops = a.workshop or find_workshop_folders()
     if not workshops:
@@ -350,27 +399,30 @@ def main():
         counts[key] = counts.get(key, 0) + 1
 
     done = skipped = failed = 0
+    size_in = size_out = 0
     for wid, title, src in items:
         base = safe_filename(title)
         if counts[base.lower()] > 1:
             base = f"{base} ({wid})"
-        ext = ".mp4" if a.optimize else (os.path.splitext(src)[1] or ".mp4")
-        dest = os.path.join(out, base + ext)
+
+        plan = None
+        if optimized:
+            info = probe(src)
+            if info is not None:
+                plan = plan_for(src, info, a)
+        src_ext = os.path.splitext(src)[1] or ".mp4"
+        changes = plan is not None and (plan.reencode or plan.remux)
+        dest = os.path.join(out, base + (".mp4" if changes else src_ext))
 
         if os.path.exists(dest) and not a.overwrite:
             skipped += 1
             continue
 
         if a.dry_run:
-            if a.optimize:
-                info = probe(src)
-                plan = plan_for(src, info, a.hd) if info else None
-                if plan and plan.reencode:
-                    what = f"re-encode: {', '.join(plan.reencode)} [{plan.summary}]"
-                elif plan and plan.remux:
-                    what = f"remux: {', '.join(plan.remux)}"
-                else:
-                    what = "copy"
+            if plan and plan.reencode:
+                what = f"re-encode to {a.codec.upper()}: {', '.join(plan.reencode)} [{plan.summary}]"
+            elif plan and plan.remux:
+                what = f"remux: {', '.join(plan.remux)}"
             else:
                 what = "copy"
             print(f"* {title} -> {os.path.basename(dest)}: would {what}")
@@ -379,7 +431,10 @@ def main():
 
         print(f"* {title} -> {os.path.basename(dest)} ...", flush=True)
         try:
-            print(f"  {process(src, dest, a)}")
+            result = process(src, dest, plan, a)
+            size_in += os.path.getsize(src)
+            size_out += os.path.getsize(dest)
+            print(f"  {result}  ({human(os.path.getsize(src))} -> {human(os.path.getsize(dest))})")
             done += 1
         except (OSError, subprocess.CalledProcessError) as e:
             print(f"! Failed: {title}: {e}")
@@ -388,6 +443,8 @@ def main():
     verb = "Would process" if a.dry_run else "Processed"
     print(f"\n{verb} {done}, skipped {skipped} already there"
           + (f", {failed} failed" if failed else "") + f" -> {out}")
+    if size_in:
+        print(f"Total size: {human(size_in)} -> {human(size_out)}")
     return 1 if failed else 0
 
 
