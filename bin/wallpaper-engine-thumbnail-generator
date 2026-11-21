@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Make a preview thumbnail for a Waywallen / Wallpaper Engine wallpaper folder.
+
+Saves the thumbnail as "<title>.jpg", using the "title" from project.json
+(falls back to preview.jpg), and points project.json's "preview" at it,
+which is the file Waywallen shows.
+
+Usage:
+    wallpaper-engine-thumbnail-generator <wallpaper_folder> --from <image>
+        Use any image (a screenshot, artwork, etc.).
+    wallpaper-engine-thumbnail-generator <wallpaper_folder> --from-extracted <repkg_folder>
+        Use the largest texture image RePKG converted in that folder.
+    wallpaper-engine-thumbnail-generator <wallpaper_folder> --screenshot [--delay N]
+        Take a full-screen screenshot with Spectacle (KDE) after N seconds.
+
+Options:
+    --size WxH   Output size, center-cropped to fill it (default 1920x1080)
+    --square     Square output (size is the shorter of W and H)
+    --quality N  JPEG quality 1-100 (default 95)
+"""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+try:
+    from PIL import Image, ImageOps
+except ImportError:
+    sys.exit("Pillow is missing. Install it with: sudo dnf install python3-pillow")
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+
+
+def largest_texture(folder):
+    best, best_px = None, 0
+    for dirpath, _, names in os.walk(folder):
+        for name in names:
+            if os.path.splitext(name)[1].lower() not in IMAGE_EXTS:
+                continue
+            if name.startswith("preview."):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                with Image.open(path) as im:
+                    px = im.width * im.height
+            except OSError:
+                continue
+            if px > best_px:
+                best, best_px = path, px
+    if not best:
+        sys.exit(f"No images found in {folder}")
+    return best
+
+
+def screenshot(delay):
+    if not shutil.which("spectacle"):
+        sys.exit("Spectacle not found. Install it with: sudo dnf install spectacle")
+    out = os.path.join(tempfile.mkdtemp(), "shot.png")
+    cmd = ["spectacle", "-b", "-n", "-f", "-o", out]
+    if delay:
+        cmd += ["-d", str(delay * 1000)]
+    subprocess.run(cmd, check=True)
+    if not os.path.exists(out):
+        sys.exit("Screenshot failed.")
+    return out
+
+
+def parse_size(text):
+    try:
+        w, h = (int(v) for v in text.lower().split("x"))
+        if w > 0 and h > 0:
+            return w, h
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError("size must look like 1920x1080")
+
+
+def thumbnail_name(folder):
+    path = os.path.join(folder, "project.json")
+    title = ""
+    if os.path.exists(path):
+        with open(path, encoding="utf-8-sig") as f:
+            title = str(json.load(f).get("title") or "")
+    # Keep the title readable, but drop characters that can't be in a filename.
+    title = "".join(c for c in title if c not in '/\\\0').strip().strip(".")
+    return (title or "preview") + ".jpg"
+
+
+def update_project(folder, preview_name):
+    path = os.path.join(folder, "project.json")
+    if not os.path.exists(path):
+        return False
+    with open(path, encoding="utf-8-sig") as f:
+        project = json.load(f)
+    if project.get("preview") == preview_name:
+        return False
+    project["preview"] = preview_name
+    shutil.copy2(path, path + ".bak")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(project, f, indent="\t", ensure_ascii=False)
+        f.write("\n")
+    return True
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Make a preview thumbnail for a wallpaper folder.")
+    ap.add_argument("folder", help="wallpaper folder (the one with project.json / scene.pkg)")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--from", dest="image", help="source image")
+    src.add_argument("--from-extracted", metavar="DIR", help="RePKG-extracted folder")
+    src.add_argument("--screenshot", action="store_true", help="screenshot the screen")
+    ap.add_argument("--delay", type=int, default=0, help="screenshot delay in seconds")
+    ap.add_argument("--size", default="1920x1080", type=parse_size,
+                    help="output size WxH, center-cropped to fill (default 1920x1080)")
+    ap.add_argument("--square", action="store_true", help="square output")
+    ap.add_argument("--quality", type=int, default=95, help="JPEG quality 1-100 (default 95)")
+    a = ap.parse_args()
+
+    if not os.path.isdir(a.folder):
+        sys.exit(f"Not a folder: {a.folder}")
+
+    if a.image:
+        source = a.image
+    elif a.from_extracted:
+        source = largest_texture(a.from_extracted)
+    else:
+        source = screenshot(a.delay)
+
+    with Image.open(source) as im:
+        im.seek(0)
+        im = im.convert("RGB")
+        width, height = a.size
+        if a.square:
+            width = height = min(width, height)
+        # Scale to cover the target, then crop the middle: exact size, no bars.
+        im = ImageOps.fit(im, (width, height), Image.LANCZOS)
+        name = thumbnail_name(a.folder)
+        out = os.path.join(a.folder, name)
+        # 4:4:4 chroma keeps thin lines and text from smearing
+        im.save(out, "JPEG", quality=a.quality, subsampling=0, optimize=True)
+
+    print(f"Wrote {out} ({im.width}x{im.height}) from {source}")
+    if update_project(a.folder, name):
+        print(f'Set "preview": "{name}" in project.json (backup: project.json.bak)')
+
+
+if __name__ == "__main__":
+    main()

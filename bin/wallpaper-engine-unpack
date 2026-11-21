@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+"""wallpaper-engine-unpack: a Python port of RePKG (github.com/notscuffed/repkg).
+
+Extracts Wallpaper Engine .pkg files and converts .tex textures into normal
+images (PNG/JPG/GIF/MP4), writing a .tex-json next to each one like RePKG does.
+
+    wallpaper-engine-unpack extract scene.pkg -o out -c
+    wallpaper-engine-unpack extract some.tex -o out
+    wallpaper-engine-unpack extract -t materials/ -o out     # convert a folder of .tex
+    wallpaper-engine-unpack info scene.pkg -e                 # list package entries
+    wallpaper-engine-unpack info some.tex                     # dump texture header
+
+"extract" is the default, so "wallpaper-engine-unpack scene.pkg -o out" works too.
+
+Needs Pillow (sudo dnf install python3-pillow). python3-lz4 is used if present
+for speed; otherwise a built-in LZ4 decoder is used.
+"""
+import argparse
+import io
+import json
+import math
+import os
+import re
+import shutil
+import struct
+import sys
+
+try:
+    from PIL import Image
+except ImportError:
+    sys.exit("Pillow is missing. Install it with: sudo dnf install python3-pillow")
+
+try:
+    import lz4.block as _lz4
+except ImportError:
+    _lz4 = None
+
+# Safety limits, same as RePKG
+MAX_FRAME_COUNT = 100_000
+MAX_IMAGE_COUNT = 100
+MAX_MIPMAP_COUNT = 32
+MAX_MIPMAP_BYTES = 250_000_000
+
+# TexFormat (header)
+TEX_FORMATS = {0: "rgba8888", 4: "dxt5", 6: "dxt3", 7: "dxt1", 8: "rg88", 9: "r8"}
+
+# TexFlags
+FLAG_NO_INTERPOLATION = 1
+FLAG_CLAMP_UVS = 2
+FLAG_IS_GIF = 4
+FLAG_IS_VIDEO = 32
+
+# FreeImageFormat -> file extension (-1 = raw texture data, not an image file)
+FIF_UNKNOWN = -1
+FIF_MP4 = 35
+FIF_EXT = {
+    0: "bmp", 1: "ico", 2: "jpg", 3: "jng", 4: "koa", 5: "lbm", 6: "mng", 7: "pbm",
+    8: "pbm", 9: "pcd", 10: "pcx", 11: "pgm", 12: "pgm", 13: "png", 14: "ppm",
+    15: "ppm", 16: "ras", 17: "tga", 18: "tif", 19: "wbmp", 20: "psd", 21: "cut",
+    22: "xbm", 23: "xpm", 24: "dds", 25: "gif", 26: "hdr", 27: "g3", 28: "sgi",
+    29: "exr", 30: "j2k", 31: "jp2", 32: "pfm", 33: "pict", 34: "raw", 35: "mp4",
+}
+
+
+class TexError(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------
+# Binary reading
+# --------------------------------------------------------------------------
+class Reader:
+    def __init__(self, data):
+        self.data = data
+        self.pos = 0
+
+    def bytes(self, n):
+        if n < 0 or self.pos + n > len(self.data):
+            raise TexError("Unexpected end of data")
+        b = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return b
+
+    def i32(self):
+        return struct.unpack("<i", self.bytes(4))[0]
+
+    def u32(self):
+        return struct.unpack("<I", self.bytes(4))[0]
+
+    def f32(self):
+        return struct.unpack("<f", self.bytes(4))[0]
+
+    def nstring(self, max_length=-1):
+        """Null-terminated string."""
+        end = self.data.find(b"\0", self.pos)
+        if end < 0:
+            raise TexError("Unterminated string")
+        raw = self.data[self.pos:end]
+        self.pos = end + 1
+        if max_length > 0:
+            raw = raw[:max_length]
+        return raw.decode("utf-8", "replace")
+
+    def i32_string(self, max_length=-1):
+        """String prefixed by its int32 length."""
+        size = self.i32()
+        if max_length > -1:
+            size = min(size, max_length)
+        if size < 0:
+            raise TexError("Size cannot be negative")
+        return self.bytes(size).decode("utf-8", "replace")
+
+
+# --------------------------------------------------------------------------
+# LZ4 block decompression
+# --------------------------------------------------------------------------
+def lz4_decompress(src, size):
+    if _lz4 is not None:
+        return _lz4.decompress(src, uncompressed_size=size)
+    dst = bytearray()
+    i, n = 0, len(src)
+    while i < n:
+        token = src[i]
+        i += 1
+        lit = token >> 4
+        if lit == 15:
+            while True:
+                b = src[i]
+                i += 1
+                lit += b
+                if b != 255:
+                    break
+        dst += src[i:i + lit]
+        i += lit
+        if i >= n:
+            break
+        offset = src[i] | (src[i + 1] << 8)
+        i += 2
+        if offset == 0:
+            raise TexError("Bad LZ4 data")
+        match = token & 15
+        if match == 15:
+            while True:
+                b = src[i]
+                i += 1
+                match += b
+                if b != 255:
+                    break
+        match += 4
+        start = len(dst) - offset
+        if start < 0:
+            raise TexError("Bad LZ4 data")
+        if offset >= match:
+            dst += dst[start:start + match]
+        else:  # overlapping copy
+            for k in range(match):
+                dst.append(dst[start + k])
+    if len(dst) < size:
+        dst += bytes(size - len(dst))
+    return bytes(dst[:size])
+
+
+# --------------------------------------------------------------------------
+# PKG
+# --------------------------------------------------------------------------
+def read_pkg(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    r = Reader(data)
+    magic = r.i32_string(max_length=32)
+    count = r.i32()
+    if count < 0 or count > 1_000_000:
+        raise TexError(f"Bad entry count: {count}")
+    entries = []
+    for _ in range(count):
+        name = r.i32_string(max_length=255)
+        offset = r.i32()
+        length = r.i32()
+        entries.append((name, offset, length))
+    data_start = r.pos
+    out = []
+    for name, offset, length in entries:
+        start = data_start + offset
+        if offset < 0 or length < 0 or start + length > len(data):
+            raise TexError(f"Entry {name} points outside the file")
+        out.append((name, data[start:start + length]))
+    return magic, data_start, out
+
+
+def safe_relpath(name):
+    """Refuse absolute paths and '..' so a package can't write outside -o."""
+    parts = [p for p in re.split(r"[\\/]+", name) if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts) or re.match(r"^[A-Za-z]:", parts[0]):
+        raise TexError(f"Unsafe entry path: {name}")
+    return os.path.join(*parts)
+
+
+# --------------------------------------------------------------------------
+# TEX
+# --------------------------------------------------------------------------
+class Mipmap:
+    __slots__ = ("width", "height", "data", "lz4", "size", "fmt")
+
+
+class Tex:
+    pass
+
+
+def mipmap_format(image_format, tex_format):
+    """Returns ('image', ext) for embedded image files, or ('raw', tex format name)."""
+    if image_format != FIF_UNKNOWN:
+        if image_format not in FIF_EXT:
+            raise TexError(f"Unknown image format: {image_format}")
+        return ("image", FIF_EXT[image_format])
+    if tex_format not in TEX_FORMATS:
+        raise TexError(f"Unknown tex format: {tex_format}")
+    return ("raw", TEX_FORMATS[tex_format])
+
+
+def read_tex(data):
+    r = Reader(data)
+    t = Tex()
+    t.magic1 = r.nstring(16)
+    if t.magic1 != "TEXV0005":
+        raise TexError(f"Unknown magic: {t.magic1}")
+    t.magic2 = r.nstring(16)
+    if t.magic2 != "TEXI0001":
+        raise TexError(f"Unknown magic: {t.magic2}")
+
+    t.format = r.i32()
+    t.flags = r.i32()
+    t.texture_width = r.i32()
+    t.texture_height = r.i32()
+    t.image_width = r.i32()
+    t.image_height = r.i32()
+    t.unk0 = r.u32()
+    if t.format not in TEX_FORMATS:
+        raise TexError(f"Unknown tex format: {t.format}")
+
+    # Image container
+    t.container_magic = r.nstring(16)
+    image_count = r.i32()
+    if image_count > MAX_IMAGE_COUNT:
+        raise TexError(f"Image count exceeds limit: {image_count}")
+    t.image_format = FIF_UNKNOWN
+    if t.container_magic in ("TEXB0001", "TEXB0002"):
+        pass
+    elif t.container_magic == "TEXB0003":
+        t.image_format = r.i32()
+    elif t.container_magic == "TEXB0004":
+        fmt = r.i32()
+        is_mp4 = r.i32() == 1
+        if fmt == FIF_UNKNOWN and is_mp4:
+            fmt = FIF_MP4
+        t.image_format = fmt
+    else:
+        raise TexError(f"Unknown container magic: {t.container_magic}")
+    version = int(t.container_magic[4:])
+    if version == 4 and t.image_format != FIF_MP4:
+        version = 3
+    t.container_version = version
+
+    fmt = mipmap_format(t.image_format, t.format)
+    t.images = []
+    for _ in range(image_count):
+        mip_count = r.i32()
+        if mip_count > MAX_MIPMAP_COUNT:
+            raise TexError(f"Mipmap count exceeds limit: {mip_count}")
+        mips = []
+        for _ in range(mip_count):
+            m = Mipmap()
+            m.lz4, m.size = False, 0
+            if version == 4:
+                p1, p2 = r.i32(), r.i32()
+                if p1 != 1 or p2 != 2:
+                    raise TexError(f"Unknown V4 mipmap params: {p1}, {p2}")
+                r.nstring()  # condition json, unused
+                p3 = r.i32()
+                if p3 != 1:
+                    raise TexError(f"Unknown V4 mipmap param3: {p3}")
+            m.width, m.height = r.i32(), r.i32()
+            if version >= 2:
+                m.lz4 = r.i32() == 1
+                m.size = r.i32()
+            n = r.i32()
+            if n > MAX_MIPMAP_BYTES:
+                raise TexError(f"Mipmap byte count exceeds limit: {n}")
+            m.data = r.bytes(n)
+            m.fmt = fmt
+            mips.append(m)
+        t.images.append(mips)
+
+    t.frames = None
+    if t.flags & FLAG_IS_GIF:
+        read_frames(r, t)
+    return t
+
+
+def read_frames(r, t):
+    magic = r.nstring(16)
+    count = r.i32()
+    if count > MAX_FRAME_COUNT:
+        raise TexError(f"Frame count exceeds limit: {count}")
+    t.gif_width = t.gif_height = 0
+    if magic == "TEXS0003":
+        t.gif_width, t.gif_height = r.i32(), r.i32()
+    elif magic not in ("TEXS0001", "TEXS0002"):
+        raise TexError(f"Unknown frame magic: {magic}")
+    t.frames = []
+    for _ in range(count):
+        image_id = r.i32()
+        frametime = r.f32()
+        if magic == "TEXS0001":
+            vals = [r.i32() for _ in range(6)]
+        else:
+            vals = [r.f32() for _ in range(6)]
+        x, y, w, wy, hx, h = vals
+        t.frames.append(dict(image=image_id, time=frametime, x=x, y=y,
+                             width=w, width_y=wy, height_x=hx, height=h))
+    if (not t.gif_width or not t.gif_height) and t.frames:
+        t.gif_width = int(t.frames[0]["width"])
+        t.gif_height = int(t.frames[0]["height"])
+
+
+def decompress_mip(m):
+    """Undo LZ4 and DXT so raw mipmaps end up as rgba8888 / rg88 / r8."""
+    data = m.data
+    if m.lz4:
+        data = lz4_decompress(data, m.size)
+    kind, name = m.fmt
+    if kind == "raw" and name in ("dxt1", "dxt3", "dxt5"):
+        n = {"dxt1": 1, "dxt3": 2, "dxt5": 3}[name]
+        img = Image.frombytes("RGBA", (m.width, m.height), data, "bcn", n)
+        return img.tobytes(), ("raw", "rgba8888")
+    return data, m.fmt
+
+
+def raw_to_image(name, data, w, h):
+    if name == "rgba8888":
+        return Image.frombytes("RGBA", (w, h), data[:w * h * 4])
+    if name == "r8":
+        return Image.frombytes("L", (w, h), data[:w * h])
+    if name == "rg88":
+        # RePKG maps RG88 to (G, G, G, R): G is brightness, R is alpha
+        img = Image.frombytes("LA", (w, h), data[:w * h * 2])
+        r_ch, g_ch = img.split()
+        return Image.merge("LA", (g_ch, r_ch))
+    raise TexError(f"Unsupported raw format: {name}")
+
+
+def tex_to_file(t):
+    """Returns (extension, bytes)."""
+    if not t.images or not t.images[0]:
+        raise TexError("Texture has no images")
+    first = t.images[0][0]
+
+    if t.flags & FLAG_IS_GIF and t.frames:
+        return "gif", tex_to_gif(t)
+
+    data, fmt = decompress_mip(first)
+    if t.flags & FLAG_IS_VIDEO:
+        if len(data) < 12 or data[4:12].lower() not in (b"ftypisom", b"ftypmsnv", b"ftypmp42"):
+            raise TexError("Expected mp4 header")
+        return "mp4", data
+
+    kind, name = fmt
+    if kind == "image":
+        return name, data
+
+    img = raw_to_image(name, data, first.width, first.height)
+    if (first.width, first.height) != (t.image_width, t.image_height):
+        img = img.crop((0, 0, t.image_width, t.image_height))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return "png", buf.getvalue()
+
+
+def tex_to_gif(t):
+    sheets = []
+    for mips in t.images:
+        data, (kind, name) = decompress_mip(mips[0])
+        if kind != "raw":
+            raise TexError("Only raw texture formats are supported for gifs")
+        sheets.append(raw_to_image(name, data, mips[0].width, mips[0].height).convert("RGBA"))
+
+    frames, durations = [], []
+    for fr in t.frames:
+        width = fr["width"] if fr["width"] != 0 else fr["height_x"]
+        height = fr["height"] if fr["height"] != 0 else fr["width_y"]
+        x = min(fr["x"], fr["x"] + width)
+        y = min(fr["y"], fr["y"] + height)
+        sign = lambda v: (v > 0) - (v < 0)
+        angle = -(math.atan2(sign(height), sign(width)) - math.pi / 4)
+        box = (int(x), int(y), int(x) + int(abs(width)), int(y) + int(abs(height)))
+        frame = sheets[fr["image"]].crop(box)
+        deg = round(math.degrees(angle))
+        if deg % 360:
+            # ImageSharp rotates clockwise, Pillow counter-clockwise
+            frame = frame.rotate(-deg, expand=True)
+        frames.append(frame)
+        durations.append(max(1, round(fr["time"] * 100)) * 10)
+
+    buf = io.BytesIO()
+    frames[0].save(buf, "GIF", save_all=True, append_images=frames[1:],
+                   duration=durations, loop=0, disposal=2)
+    return buf.getvalue()
+
+
+def is_pow2(n):
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def tex_json(t):
+    info = {
+        "bleedtransparentcolors": True,
+        "clampuvs": bool(t.flags & FLAG_CLAMP_UVS),
+        "format": TEX_FORMATS[t.format],
+        "nomip": str(len(t.images[0]) == 1).lower(),
+        "nointerpolation": str(bool(t.flags & FLAG_NO_INTERPOLATION)).lower(),
+        "nonpoweroftwo": str(not is_pow2(t.image_width) or not is_pow2(t.image_height)).lower(),
+    }
+    if t.flags & FLAG_IS_GIF and t.frames:
+        info["spritesheetsequences"] = [{
+            "duration": 1,
+            "frames": len(t.frames),
+            "width": t.gif_width,
+            "height": t.gif_height,
+        }]
+    return json.dumps(info, indent=2)
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+def write_file(path, data, overwrite, label=None):
+    if not overwrite and os.path.exists(path):
+        print(f"* Skipping, already exists: {path}")
+        return False
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+    if label:
+        print(f"* {label}: {path}")
+    return True
+
+
+def convert_tex(data, base_path, overwrite, name):
+    print(f"* Reading: {name}")
+    try:
+        t = read_tex(data)
+    except Exception as e:  # noqa: BLE001
+        print(f"Failed to read texture: {e}")
+        return
+    try:
+        ext, out = tex_to_file(t)
+        write_file(f"{base_path}.{ext}", out, overwrite)
+        with open(f"{base_path}.tex-json", "w", encoding="utf-8") as f:
+            f.write(tex_json(t))
+    except Exception as e:  # noqa: BLE001
+        print(f"Failed to write texture: {e}")
+
+
+def norm_exts(s):
+    if not s:
+        return None
+    return [e if e.startswith(".") else "." + e for e in (x.strip() for x in s.split(",")) if e]
+
+
+def project_info(pkg_path):
+    p = os.path.join(os.path.dirname(os.path.abspath(pkg_path)), "project.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding="utf-8-sig") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def safe_filename(s):
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", s).strip() or "untitled"
+
+
+def extract_pkg(path, a, out_dir, default_name=None):
+    print(f"\n### Extracting package: {os.path.abspath(path)}")
+    _, _, entries = read_pkg(path)
+
+    preview = ""
+    if default_name is not None and not a.singledir:
+        name = default_name
+        if a.usename:
+            proj = project_info(path) or {}
+            name = safe_filename(str(proj.get("title") or default_name))
+            preview = str(proj.get("preview") or "")
+        out_dir = os.path.join(out_dir, name)
+
+    skip, only = norm_exts(a.ignoreexts), norm_exts(a.onlyexts)
+    for name, data in entries:
+        low = name.lower()
+        if skip and any(low.endswith(e.lower()) for e in skip):
+            continue
+        if not skip and only and not any(low.endswith(e.lower()) for e in only):
+            continue
+        rel = safe_relpath(name)
+        if a.singledir:
+            rel = os.path.basename(rel)
+        dest = os.path.join(out_dir, rel)
+        write_file(dest, data, a.overwrite, "Extracting")
+        if not a.no_tex_convert and low.endswith(".tex"):
+            convert_tex(data, os.path.splitext(dest)[0], a.overwrite, name)
+
+    if a.copyproject and not a.singledir:
+        src_dir = os.path.dirname(os.path.abspath(path))
+        if not preview:
+            preview = str((project_info(path) or {}).get("preview") or "")
+        for fname in os.listdir(src_dir):
+            if fname.lower() == "project.json" or (preview and fname.lower() == preview.lower()):
+                dest = os.path.join(out_dir, fname)
+                if not a.overwrite and os.path.exists(dest):
+                    print(f"* Skipping, already exists: {dest}")
+                    continue
+                os.makedirs(out_dir, exist_ok=True)
+                shutil.copyfile(os.path.join(src_dir, fname), dest)
+                print(f"* Copying: {os.path.join(src_dir, fname)}")
+
+
+def cmd_extract(a):
+    out = a.output
+    inp = a.input
+    if os.path.isfile(inp):
+        os.makedirs(out, exist_ok=True)
+        low = inp.lower()
+        if low.endswith(".pkg"):
+            extract_pkg(inp, a, out)
+        elif low.endswith(".tex"):
+            with open(inp, "rb") as f:
+                data = f.read()
+            base = os.path.join(out, os.path.splitext(os.path.basename(inp))[0])
+            convert_tex(data, base, a.overwrite, inp)
+        else:
+            print(f"Unrecognized file extension: {os.path.splitext(inp)[1]}")
+            return 1
+    elif os.path.isdir(inp):
+        if a.tex:
+            os.makedirs(out, exist_ok=True)
+            for root, dirs, files in os.walk(inp):
+                for fname in sorted(files):
+                    if fname.lower().endswith(".tex"):
+                        p = os.path.join(root, fname)
+                        with open(p, "rb") as f:
+                            data = f.read()
+                        convert_tex(data, os.path.join(out, os.path.splitext(fname)[0]),
+                                    a.overwrite, p)
+                if not a.recursive:
+                    break
+        elif a.recursive:
+            root_abs = os.path.abspath(inp)
+            for root, dirs, files in os.walk(inp):
+                for fname in sorted(files):
+                    if fname.lower().endswith(".pkg"):
+                        rel = os.path.relpath(os.path.abspath(root), root_abs)
+                        p = os.path.join(root, fname)
+                        if rel == ".":
+                            extract_pkg(p, a, out)
+                        else:
+                            extract_pkg(p, a, out, rel)
+        else:
+            # Steam workshop layout: <input>/<id>/scene.pkg
+            for d in sorted(os.listdir(inp)):
+                sub = os.path.join(inp, d)
+                if os.path.isdir(sub):
+                    for fname in sorted(os.listdir(sub)):
+                        if fname.lower().endswith(".pkg"):
+                            extract_pkg(os.path.join(sub, fname), a, out, d)
+    else:
+        print(f"Input file not found\n{inp}")
+        return 1
+    print("Done")
+    return 0
+
+
+def info_pkg(path, a, label):
+    proj = project_info(path)
+    if a.title and proj is not None:
+        if a.title.lower() not in str(proj.get("title", "")).lower():
+            return
+    print(f"\n### Package info: {label}")
+    if proj is not None and a.projectinfo:
+        keys = a.projectinfo.split(",")
+        for k in proj:
+            if keys == ["*"] or k.lower() in (x.lower() for x in keys):
+                v = proj[k]
+                print(f"{k}: {json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v}")
+    if a.printentries:
+        magic, header_size, entries = read_pkg(path)
+        print(f"Magic: {magic}, entries: {len(entries)}, header size: {header_size}")
+        print("Package entries:")
+        rows = [(n, len(d)) for n, d in entries]
+        if a.sort:
+            if a.sortby == "size":
+                rows.sort(key=lambda r: r[1])
+            elif a.sortby == "extension":
+                rows.sort(key=lambda r: (os.path.splitext(r[0])[1].lower(), r[0].lower()))
+            else:
+                rows.sort(key=lambda r: r[0].lower())
+        for n, size in rows:
+            print(f"* {n} - {size} bytes")
+
+
+def info_tex(path):
+    with open(path, "rb") as f:
+        t = read_tex(f.read())
+    flags = [n for bit, n in ((1, "NoInterpolation"), (2, "ClampUVs"), (4, "IsGif"),
+                              (32, "IsVideoTexture")) if t.flags & bit]
+    kind, name = mipmap_format(t.image_format, t.format)
+    print(f"\n### Texture info: {path}")
+    print(f"Format: {TEX_FORMATS[t.format]}  Flags: {', '.join(flags) or 'None'} ({t.flags})")
+    print(f"Texture size: {t.texture_width}x{t.texture_height}  Image size: {t.image_width}x{t.image_height}")
+    print(f"Container: {t.container_magic}  Stored as: {name}")
+    for i, mips in enumerate(t.images):
+        print(f"Image {i}: " + ", ".join(
+            f"{m.width}x{m.height}{' lz4' if m.lz4 else ''}" for m in mips))
+    if t.frames:
+        print(f"Frames: {len(t.frames)} ({t.gif_width}x{t.gif_height})")
+
+
+def cmd_info(a):
+    inp = a.input
+    if os.path.isfile(inp):
+        if inp.lower().endswith(".pkg"):
+            info_pkg(inp, a, os.path.abspath(inp))
+        elif inp.lower().endswith(".tex"):
+            info_tex(inp)
+        else:
+            print(f"Unrecognized file extension: {os.path.splitext(inp)[1]}")
+            return 1
+    elif os.path.isdir(inp):
+        if a.tex:
+            for root, _, files in os.walk(inp):
+                for fname in sorted(files):
+                    if fname.lower().endswith(".tex"):
+                        try:
+                            info_tex(os.path.join(root, fname))
+                        except Exception as e:  # noqa: BLE001
+                            print(f"Failed to read {fname}: {e}")
+        else:
+            for d in sorted(os.listdir(inp)):
+                sub = os.path.join(inp, d)
+                if os.path.isdir(sub):
+                    for fname in sorted(os.listdir(sub)):
+                        if fname.lower().endswith(".pkg"):
+                            info_pkg(os.path.join(sub, fname), a, os.path.join(d, fname))
+    else:
+        print(f"Input file/directory doesn't exist!\n{inp}")
+        return 1
+    print("Done")
+    return 0
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog=os.path.basename(sys.argv[0]),
+        description="Extract Wallpaper Engine .pkg files and convert .tex textures (Python RePKG).")
+    sub = ap.add_subparsers(dest="command")
+
+    e = sub.add_parser("extract", help="Extract PKG / convert TEX into image")
+    e.add_argument("input", help="path to a .pkg, a .tex, or a folder")
+    e.add_argument("-o", "--output", default="./output", help="output folder (default ./output)")
+    e.add_argument("-i", "--ignoreexts", help="don't extract these extensions (comma separated)")
+    e.add_argument("-e", "--onlyexts", help="only extract these extensions (comma separated)")
+    e.add_argument("-t", "--tex", action="store_true", help="convert all .tex files in the input folder")
+    e.add_argument("-s", "--singledir", action="store_true", help="put all files in one folder")
+    e.add_argument("-r", "--recursive", action="store_true", help="search all subfolders")
+    e.add_argument("-c", "--copyproject", action="store_true",
+                   help="copy project.json and the preview image from beside the .pkg")
+    e.add_argument("-n", "--usename", action="store_true",
+                   help="name project subfolders by project.json title instead of id")
+    e.add_argument("--no-tex-convert", action="store_true", help="don't convert .tex into images")
+    e.add_argument("--overwrite", action="store_true", help="overwrite existing files")
+    e.set_defaults(func=cmd_extract)
+
+    i = sub.add_parser("info", help="Dump PKG/TEX info")
+    i.add_argument("input", help="path to a .pkg, a .tex, or a folder")
+    i.add_argument("-s", "--sort", action="store_true", help="sort entries")
+    i.add_argument("-b", "--sortby", default="name", choices=("name", "extension", "size"))
+    i.add_argument("-t", "--tex", action="store_true", help="dump info for all .tex files in a folder")
+    i.add_argument("-p", "--projectinfo", help="keys to show from project.json (comma separated, * for all)")
+    i.add_argument("-e", "--printentries", action="store_true", help="list package entries")
+    i.add_argument("--title", help="only show packages whose title contains this")
+    i.set_defaults(func=cmd_info)
+    return ap
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] not in ("extract", "info", "-h", "--help"):
+        argv = ["extract"] + argv
+    ap = build_parser()
+    a = ap.parse_args(argv)
+    if not getattr(a, "func", None):
+        ap.print_help()
+        return 1
+    try:
+        return a.func(a)
+    except TexError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
