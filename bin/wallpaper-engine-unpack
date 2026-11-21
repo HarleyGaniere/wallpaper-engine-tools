@@ -10,6 +10,8 @@ images (PNG/JPG/GIF/MP4), writing a .tex-json next to each one like RePKG does.
     wallpaper-engine-unpack extract scene.pkg -o out -c
     wallpaper-engine-unpack extract some.tex -o out
     wallpaper-engine-unpack extract -t materials/ -o out     # convert a folder of .tex
+    wallpaper-engine-unpack extract <workshop-folder> -o out -c -u unpacked-scenes
+                                                      # bulk: out/<id>/unpacked-scenes/
     wallpaper-engine-unpack info scene.pkg -e                 # list package entries
     wallpaper-engine-unpack info some.tex                     # dump texture header
 
@@ -43,6 +45,10 @@ MAX_FRAME_COUNT = 100_000
 MAX_IMAGE_COUNT = 100
 MAX_MIPMAP_COUNT = 32
 MAX_MIPMAP_BYTES = 250_000_000
+
+# Written next to the extracted scene with --scene-dir; holds the original
+# package header (e.g. PKGV0016) so wallpaper-engine-repack can reuse it.
+VERSION_FILE = ".pkg-version"
 
 # TexFormat (header)
 TEX_FORMATS = {0: "rgba8888", 4: "dxt5", 6: "dxt3", 7: "dxt1", 8: "rg88", 9: "r8"}
@@ -486,7 +492,7 @@ def safe_filename(s):
 
 def extract_pkg(path, a, out_dir, default_name=None):
     print(f"\n### Extracting package: {os.path.abspath(path)}")
-    _, _, entries = read_pkg(path)
+    magic, _, entries = read_pkg(path)
 
     preview = ""
     if default_name is not None and not a.singledir:
@@ -496,6 +502,15 @@ def extract_pkg(path, a, out_dir, default_name=None):
             name = safe_filename(str(proj.get("title") or default_name))
             preview = str(proj.get("preview") or "")
         out_dir = os.path.join(out_dir, name)
+
+    # With --scene-dir, the package contents go in a subfolder and the
+    # wallpaper folder keeps the Workshop layout (project.json, preview,
+    # scene.pkg), so wallpaper-engine-repack can rebuild scene.pkg in place.
+    scene_dir = os.path.join(out_dir, a.scene_dir) if a.scene_dir else out_dir
+    if a.scene_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, VERSION_FILE), "w", encoding="ascii") as f:
+            f.write(magic + "\n")
 
     skip, only = norm_exts(a.ignoreexts), norm_exts(a.onlyexts)
     for name, data in entries:
@@ -507,7 +522,7 @@ def extract_pkg(path, a, out_dir, default_name=None):
         rel = safe_relpath(name)
         if a.singledir:
             rel = os.path.basename(rel)
-        dest = os.path.join(out_dir, rel)
+        dest = os.path.join(scene_dir, rel)
         write_file(dest, data, a.overwrite, "Extracting")
         if not a.no_tex_convert and low.endswith(".tex"):
             convert_tex(data, os.path.splitext(dest)[0], a.overwrite, name)
@@ -678,6 +693,9 @@ def build_parser():
                    help="copy project.json and the preview image from beside the .pkg")
     e.add_argument("-n", "--usename", action="store_true",
                    help="name project subfolders by project.json title instead of id")
+    e.add_argument("-u", "--scene-dir", metavar="NAME",
+                   help="put package contents in this subfolder of each wallpaper folder "
+                        "(e.g. unpacked-scenes), keeping project.json and the preview beside it")
     e.add_argument("--no-tex-convert", action="store_true", help="don't convert .tex into images")
     e.add_argument("--overwrite", action="store_true", help="overwrite existing files")
     e.set_defaults(func=cmd_extract)

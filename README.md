@@ -40,11 +40,22 @@ Point `wallpaper-engine-unpack` at a folder laid out like Steam's Workshop folde
 
 ```bash
 WS=~/.local/share/Steam/steamapps/workshop/content/431960
-wallpaper-engine-unpack extract "$WS" -o ~/wallpapers/unpacked -c -n
+wallpaper-engine-unpack extract "$WS" -o ~/wallpapers/unpacked -c -n -u unpacked-scenes
+```
+
+Each wallpaper folder then keeps the same layout as in the Workshop, with the package contents in their own subfolder:
+
+```
+unpacked/
+└── Wallpaper Title/
+    ├── project.json
+    ├── preview.jpg
+    └── unpacked-scenes/     ← contents of scene.pkg (scene.json, materials/, ...)
 ```
 
 * `-c` also copies each wallpaper's `project.json` and preview image.
 * `-n` names each folder after the wallpaper's title. Leave it out to use the Workshop ID instead; IDs are always unique, while two wallpapers with the same title would share one folder.
+* `-u unpacked-scenes` puts the package contents in that subfolder. Leave it out to unpack them straight into the wallpaper folder.
 * `--no-tex-convert` skips converting textures to images: much faster, and about half the disk space.
 * Running it again skips files that already exist, so an interrupted run can simply be restarted. Add `--overwrite` to redo everything.
 * Video and web wallpapers have no `.pkg` and are skipped; their files in the Workshop folder are already usable as-is.
@@ -60,6 +71,17 @@ Common Workshop folder locations:
 | Other library folders | `<library>/steamapps/workshop/content/431960` |
 
 Check the space first: `du -sh "$WS"`. The unpacked copy is roughly that size again, or up to about double with texture conversion on.
+
+## Bulk Repacking
+
+After editing, rebuild `scene.pkg` next to `project.json` in one wallpaper folder, or in all of them:
+
+```bash
+wallpaper-engine-repack ~/wallpapers/unpacked/"Wallpaper Title"
+wallpaper-engine-repack --all ~/wallpapers/unpacked
+```
+
+Each folder ends up with `project.json`, the preview and `scene.pkg`, the same files a Workshop wallpaper has, ready for a player like Waywallen. The original package header version is saved in `.pkg-version` while unpacking and reused automatically. Use `-u NAME` if you unpacked into a subfolder other than `unpacked-scenes`.
 
 ## License
 

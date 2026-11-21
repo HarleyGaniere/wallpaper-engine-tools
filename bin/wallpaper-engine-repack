@@ -5,6 +5,11 @@
 
 Usage:
     wallpaper-engine-repack <extracted_folder> <output.pkg> [--like original.pkg]
+    wallpaper-engine-repack <wallpaper_folder>
+        Packs <wallpaper_folder>/unpacked-scenes into <wallpaper_folder>/scene.pkg
+        (the layout wallpaper-engine-unpack makes with -u unpacked-scenes).
+    wallpaper-engine-repack --all <folder>
+        Does that for every wallpaper folder inside <folder>.
 
 Leaves out files that don't belong in a .pkg:
   * project.json and preview.* (these sit next to scene.pkg, not inside it)
@@ -50,18 +55,14 @@ def pack_str(s):
     return struct.pack("<i", len(b)) + b
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("folder")
-    ap.add_argument("output")
-    ap.add_argument("--like", help="original scene.pkg to copy the version header from")
-    ap.add_argument("--magic", default="PKGV0001")
-    a = ap.parse_args()
+VERSION_FILE = ".pkg-version"
+DEFAULT_MAGIC = "PKGV0001"
 
-    magic = read_magic(a.like) if a.like else a.magic
-    files = collect(a.folder)
+
+def pack(folder, output, magic):
+    files = collect(folder)
     if not any(r == "scene.json" for r, _ in files):
-        sys.exit("No scene.json in that folder; is it the extracted wallpaper?")
+        raise SystemExit(f"No scene.json in {folder}; is it an extracted wallpaper?")
 
     header = pack_str(magic) + struct.pack("<i", len(files))
     offset = 0
@@ -70,13 +71,62 @@ def main():
         header += pack_str(rel) + struct.pack("<ii", offset, size)
         offset += size
 
-    with open(a.output, "wb") as out:
+    tmp = output + ".tmp"
+    with open(tmp, "wb") as out:
         out.write(header)
         for _, full in files:
             with open(full, "rb") as f:
                 out.write(f.read())
+    os.replace(tmp, output)
+    print(f"Wrote {output}: {len(files)} files, header {magic}")
 
-    print(f"Wrote {a.output}: {len(files)} files, header {magic}")
+
+def saved_magic(wallpaper_folder):
+    try:
+        with open(os.path.join(wallpaper_folder, VERSION_FILE), encoding="ascii") as f:
+            magic = f.read().strip()
+        return magic if magic.startswith("PKGV") else DEFAULT_MAGIC
+    except OSError:
+        return DEFAULT_MAGIC
+
+
+def pack_in_place(wallpaper_folder, scene_dir, magic=None):
+    src = os.path.join(wallpaper_folder, scene_dir)
+    pack(src, os.path.join(wallpaper_folder, "scene.pkg"), magic or saved_magic(wallpaper_folder))
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog=os.path.basename(sys.argv[0]),
+        description="Pack an extracted scene folder back into scene.pkg.")
+    ap.add_argument("folder", help="extracted folder, a wallpaper folder, or with --all a folder of them")
+    ap.add_argument("output", nargs="?", help="output .pkg (leave out to write <folder>/scene.pkg)")
+    ap.add_argument("--all", action="store_true",
+                    help="repack every wallpaper folder inside FOLDER")
+    ap.add_argument("-u", "--scene-dir", default="unpacked-scenes", metavar="NAME",
+                    help="subfolder holding the extracted scene (default unpacked-scenes)")
+    ap.add_argument("--like", help="original scene.pkg to copy the version header from")
+    ap.add_argument("--magic", help=f"version header to write (default: saved one, or {DEFAULT_MAGIC})")
+    a = ap.parse_args()
+
+    magic = read_magic(a.like) if a.like else a.magic
+
+    if a.all:
+        done = 0
+        for name in sorted(os.listdir(a.folder)):
+            wallpaper = os.path.join(a.folder, name)
+            if os.path.isfile(os.path.join(wallpaper, a.scene_dir, "scene.json")):
+                pack_in_place(wallpaper, a.scene_dir, magic)
+                done += 1
+        print(f"Repacked {done} wallpaper(s)")
+        return
+
+    if a.output:
+        pack(a.folder, a.output, magic or DEFAULT_MAGIC)
+    elif os.path.isdir(os.path.join(a.folder, a.scene_dir)):
+        pack_in_place(a.folder, a.scene_dir, magic)
+    else:
+        ap.error(f"give an output .pkg, or a wallpaper folder containing {a.scene_dir}/")
 
 
 if __name__ == "__main__":
