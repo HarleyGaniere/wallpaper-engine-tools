@@ -34,6 +34,33 @@ wallpaper-engine-thumbnail-generator <wallpaper-folder> --screenshot --delay 5
 
 `--like` copies the version header from the original package; without it a generic `PKGV0001` header is used.
 
+## Bulk Unpacking
+
+Point `wallpaper-engine-unpack` at a folder laid out like Steam's Workshop folder (one numbered subfolder per wallpaper) and it unpacks every wallpaper that has a `.pkg`, each into its own folder:
+
+```bash
+WS=~/.local/share/Steam/steamapps/workshop/content/431960
+wallpaper-engine-unpack extract "$WS" -o ~/wallpapers/unpacked -c -n
+```
+
+* `-c` also copies each wallpaper's `project.json` and preview image.
+* `-n` names each folder after the wallpaper's title. Leave it out to use the Workshop ID instead; IDs are always unique, while two wallpapers with the same title would share one folder.
+* `--no-tex-convert` skips converting textures to images: much faster, and about half the disk space.
+* Running it again skips files that already exist, so an interrupted run can simply be restarted. Add `--overwrite` to redo everything.
+* Video and web wallpapers have no `.pkg` and are skipped; their files in the Workshop folder are already usable as-is.
+* Add `-r` to search nested folders at any depth instead of only one level down.
+
+Common Workshop folder locations:
+
+| Steam install | Workshop folder |
+| --- | --- |
+| Native package | `~/.local/share/Steam/steamapps/workshop/content/431960` |
+| Debian/Ubuntu package | `~/.steam/debian-installation/steamapps/workshop/content/431960` |
+| Flatpak | `~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/workshop/content/431960` or `~/.var/app/com.valvesoftware.Steam/data/Steam/steamapps/workshop/content/431960` |
+| Other library folders | `<library>/steamapps/workshop/content/431960` |
+
+Check the space first: `du -sh "$WS"`. The unpacked copy is roughly that size again, or up to about double with texture conversion on.
+
 ## License
 
 Copyright (C) 2026 HarleyGaniere
