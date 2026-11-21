@@ -8,6 +8,7 @@ Command-line tools for unpacking, editing and repacking Wallpaper Engine scene w
 | `wallpaper-engine-repack` | Packs an extracted folder back into a `scene.pkg`. |
 | `wallpaper-engine-copy-videos` | Copies every video wallpaper from the Workshop into one folder, named by title, exactly as it is. |
 | `wallpaper-engine-copy-videos-optimized` | The same, but as MP4, re-encoding badly encoded videos, with options to cap the resolution or convert to HEVC. |
+| `wallpaper-engine-copy-wallpapers` | Copies every Workshop wallpaper (scene, video and web) into a folder named after its title instead of its Workshop ID. |
 | `wallpaper-engine-thumbnail-generator` | Makes a thumbnail (1920×1080 by default) named after the `project.json` title and points `"preview"` at it. |
 
 ## Install
@@ -166,6 +167,48 @@ wallpaper-engine-copy-videos-optimized "$WS" --hevc --1080p --preset slow
 * A codec conversion to H.264 can make a file slightly larger (VP9 and HEVC compress better), but H.264 is far lighter to play, which matters most on GPUs without hardware video decoding. Audio is kept, or converted to AAC if MP4 can't hold it.
 * Each video's size before and after is shown, with a total at the end.
 * Needs `ffmpeg` and `ffprobe` with the `libx264` encoder, and `libx265` for `--hevc` (on Fedora, the full `ffmpeg` package from RPM Fusion).
+
+## Copying Wallpapers by Title
+
+The Workshop stores each wallpaper in a folder named by its Workshop ID, like `2970990736`. `wallpaper-engine-copy-wallpapers` copies them, with every file, into folders named after the title in their `project.json`:
+
+```
+/home/$USER/Pictures/Wallpapers/
+├── [ BLUEY ] Bluey's Big Play ( WIP )/
+│   ├── index.html
+│   ├── preview.gif
+│   └── project.json
+└── Rainy Night/
+    ├── project.json
+    ├── preview.jpg
+    └── scene.pkg
+```
+
+```bash
+WS=~/.local/share/Steam/steamapps/workshop/content/431960
+
+# Preview, then copy every wallpaper
+wallpaper-engine-copy-wallpapers "$WS" -o /home/$USER/Pictures/Wallpapers --dry-run
+wallpaper-engine-copy-wallpapers "$WS" -o /home/$USER/Pictures/Wallpapers
+
+# Only some types
+wallpaper-engine-copy-wallpapers "$WS" -o /home/$USER/Pictures/Wallpapers --type scene,web
+```
+
+* Titles are kept as they are, except for characters a folder name can't contain (`/` becomes `_`). When two wallpapers share a title, the Workshop ID is added: `Rainy Night (123456)`.
+* `--type` picks wallpaper types: `scene`, `video`, `web` or `application`.
+* Folders that already exist are skipped, so running it again only copies new subscriptions. `--overwrite` replaces existing folders, for example after a wallpaper was updated on the Workshop.
+* Leave `"$WS"` out to search the usual Steam locations, or list several Workshop folders to copy from more than one Steam library.
+
+### For Waywallen
+
+Waywallen's Wallpaper Engine plugin only finds wallpapers in a Steam-style layout. `--waywallen` copies them there:
+
+```bash
+wallpaper-engine-copy-wallpapers "$WS" -o /home/$USER/Pictures/Wallpapers/WallpaperEngine --waywallen
+```
+
+This creates `WallpaperEngine/steamapps/common/wallpaper_engine/projects/myprojects/<title>/`. Then add `/home/$USER/Pictures/Wallpapers/WallpaperEngine` as a library under Plugins → Wallpaper Engine in Waywallen. It also keeps the preview images deep enough that Waywallen's image plugin doesn't list them as separate still wallpapers, which happens when wallpaper folders sit directly in a folder the image plugin scans.
 
 ## License
 

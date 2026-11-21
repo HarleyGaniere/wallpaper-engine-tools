@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 HarleyGaniere
+"""Copy Wallpaper Engine Workshop wallpapers into folders named after their titles.
+
+Usage:
+    wallpaper-engine-copy-wallpapers [workshop_folder ...] [-o output_folder]
+        [--type scene,video,web] [--waywallen] [--overwrite] [--dry-run]
+
+Each Workshop wallpaper lives in a folder named by its numeric Workshop ID.
+This copies every one of them (all files: project.json, preview, scene.pkg,
+video, web pages, ...) to <output>/<title>/, where the title comes from the
+wallpaper's project.json. When two wallpapers share a title, the Workshop ID
+is added: "Rainy Night (123456)".
+
+--waywallen puts the folders where Waywallen's Wallpaper Engine plugin looks
+for them, <output>/steamapps/common/wallpaper_engine/projects/myprojects/,
+so you can add <output> as a Wallpaper Engine library in Waywallen.
+
+Without a workshop folder it looks in the usual Steam locations (native,
+Debian/Ubuntu and Flatpak). The default output is ~/Pictures/Wallpapers.
+Folders that already exist are skipped unless --overwrite is given.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+
+WORKSHOP_SUFFIX = "steamapps/workshop/content/431960"
+STEAM_ROOTS = [
+    "~/.local/share/Steam",
+    "~/.steam/steam",
+    "~/.steam/debian-installation",
+    "~/.var/app/com.valvesoftware.Steam/.local/share/Steam",
+    "~/.var/app/com.valvesoftware.Steam/data/Steam",
+]
+DEFAULT_OUTPUT = "~/Pictures/Wallpapers"
+WAYWALLEN_SUBDIR = "steamapps/common/wallpaper_engine/projects/myprojects"
+
+
+def find_workshop_folders():
+    found, seen = [], set()
+    for root in STEAM_ROOTS:
+        path = os.path.join(os.path.expanduser(root), WORKSHOP_SUFFIX)
+        if os.path.isdir(path):
+            real = os.path.realpath(path)
+            if real not in seen:
+                seen.add(real)
+                found.append(path)
+    return found
+
+
+def safe_filename(text):
+    """Keep the title readable; only drop what can't be in a folder name."""
+    text = re.sub(r'[/\\\x00-\x1f]', "_", text)
+    text = re.sub(r"\s+", " ", text).strip().strip(".")
+    return text[:200] or "untitled"
+
+
+def read_project(folder):
+    try:
+        with open(os.path.join(folder, "project.json"), encoding="utf-8-sig") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def folder_size(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog=os.path.basename(sys.argv[0]),
+        description="Copy Wallpaper Engine Workshop wallpapers into folders named after their titles.")
+    ap.add_argument("workshop", nargs="*",
+                    help="Workshop folder(s) (.../steamapps/workshop/content/431960); "
+                         "default: search the usual Steam locations")
+    ap.add_argument("-o", "--output", default=DEFAULT_OUTPUT,
+                    help=f"destination folder (default {DEFAULT_OUTPUT})")
+    ap.add_argument("--type", metavar="TYPES",
+                    help="only these wallpaper types, comma separated: scene, video, web, "
+                         "application (default: all)")
+    ap.add_argument("--waywallen", action="store_true",
+                    help=f"put the folders under OUTPUT/{WAYWALLEN_SUBDIR}/ for Waywallen")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="replace folders that already exist in the output")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="show what would be copied without copying")
+    a = ap.parse_args()
+
+    workshops = a.workshop or find_workshop_folders()
+    if not workshops:
+        sys.exit("No Workshop folder found. Give its path, e.g. "
+                 f"~/.local/share/Steam/{WORKSHOP_SUFFIX}")
+    types = {t.strip().lower() for t in a.type.split(",")} if a.type else None
+
+    out = os.path.expanduser(a.output)
+    if a.waywallen:
+        out = os.path.join(out, WAYWALLEN_SUBDIR)
+
+    items = []
+    for ws in workshops:
+        if not os.path.isdir(ws):
+            sys.exit(f"Not a folder: {ws}")
+        print(f"Scanning {ws}")
+        for wid in sorted(os.listdir(ws)):
+            src = os.path.join(ws, wid)
+            if not os.path.isdir(src):
+                continue
+            project = read_project(src)
+            if project is None:
+                print(f"! {wid}: no readable project.json, skipped")
+                continue
+            kind = str(project.get("type", "")).lower() or "unknown"
+            items.append((wid, str(project.get("title") or wid), kind, src))
+
+    # Count title clashes across all wallpapers, before filtering by type, so a
+    # wallpaper gets the same folder name no matter which --type is used.
+    counts = {}
+    for _, title, _, _ in items:
+        key = safe_filename(title).lower()
+        counts[key] = counts.get(key, 0) + 1
+    if types:
+        items = [item for item in items if item[2] in types]
+
+    copied = skipped = failed = 0
+    total = 0
+    for wid, title, kind, src in items:
+        name = safe_filename(title)
+        if counts[name.lower()] > 1:
+            name = f"{name} ({wid})"
+        dest = os.path.join(out, name)
+
+        if os.path.exists(dest) and not a.overwrite:
+            skipped += 1
+            continue
+
+        size = folder_size(src)
+        print(f"* {wid} [{kind}] -> {name}/ ({human(size)})")
+        if a.dry_run:
+            copied += 1
+            total += size
+            continue
+        try:
+            if os.path.exists(dest):
+                shutil.rmtree(dest)
+            os.makedirs(out, exist_ok=True)
+            tmp = dest + ".part"
+            if os.path.exists(tmp):
+                shutil.rmtree(tmp)
+            shutil.copytree(src, tmp, symlinks=True)
+            os.replace(tmp, dest)
+            copied += 1
+            total += size
+        except OSError as e:
+            print(f"! Failed: {title}: {e}")
+            failed += 1
+
+    verb = "Would copy" if a.dry_run else "Copied"
+    print(f"\n{verb} {copied} ({human(total)}), skipped {skipped} already there"
+          + (f", {failed} failed" if failed else "") + f" -> {out}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
