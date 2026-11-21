@@ -42,13 +42,13 @@ Point `wallpaper-engine-unpack` at a folder laid out like Steam's Workshop folde
 
 ```bash
 WS=~/.local/share/Steam/steamapps/workshop/content/431960
-wallpaper-engine-unpack extract "$WS" -o ~/wallpapers/unpacked -c -n -u unpacked-scenes
+wallpaper-engine-unpack extract "$WS" -o /home/$USER/Pictures/Wallpapers/Unpacked -c -n -u unpacked-scenes
 ```
 
 Each wallpaper folder then keeps the same layout as in the Workshop, with the package contents in their own subfolder:
 
 ```
-unpacked/
+/home/$USER/Pictures/Wallpapers/Unpacked/
 └── Wallpaper Title/
     ├── project.json
     ├── preview.jpg
@@ -79,8 +79,8 @@ Check the space first: `du -sh "$WS"`. The unpacked copy is roughly that size ag
 After editing, rebuild `scene.pkg` next to `project.json` in one wallpaper folder, or in all of them:
 
 ```bash
-wallpaper-engine-repack ~/wallpapers/unpacked/"Wallpaper Title" -u unpacked-scenes
-wallpaper-engine-repack --all ~/wallpapers/unpacked -u unpacked-scenes
+wallpaper-engine-repack "/home/$USER/Pictures/Wallpapers/Unpacked/Wallpaper Title" -u unpacked-scenes
+wallpaper-engine-repack --all /home/$USER/Pictures/Wallpapers/Unpacked -u unpacked-scenes
 ```
 
 Each folder ends up with `project.json`, the preview and `scene.pkg`, the same files a Workshop wallpaper has, ready for a player like Waywallen. The original package header version is saved in `.pkg-version` while unpacking and reused automatically. `-u` must match the subfolder name used when unpacking; `unpacked-scenes` is also the default, so it can be left out.
