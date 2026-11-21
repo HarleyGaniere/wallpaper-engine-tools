@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 HarleyGaniere
+"""Copy the video wallpapers from a Wallpaper Engine Workshop folder into one
+folder, optimizing badly encoded ones along the way.
+
+Usage:
+    wallpaper-engine-copy-videos [workshop_folder ...] [-o output_folder]
+                                 [--1080p] [--no-optimize] [--dry-run]
+
+Finds every wallpaper whose project.json says "type": "video" and puts its
+video in the output folder as an .mp4 named after the wallpaper's title
+("Rainy Night.mp4"; the Workshop ID is added when two titles match).
+
+Each video is checked with ffprobe and only re-encoded when something is
+actually wrong with it for wallpaper playback:
+  * a codec that is heavy to decode (HEVC, VP9, AV1, ...) instead of H.264
+  * 10-bit or 4:2:2 / 4:4:4 color, which many decoders handle poorly
+  * a bitrate far higher than the resolution needs (bloated file)
+  * more than 60 frames per second
+  * interlaced video
+  * larger than 1920x1080, only when --1080p is given
+Videos that are fine but not "fast start" (index at the end) or not in an MP4
+container are remuxed without re-encoding, which is lossless and quick.
+Everything else is copied as is. A re-encode that comes out larger than the
+original, when the only problem was bitrate, is thrown away.
+
+Without a workshop folder it looks in the usual Steam locations (native,
+Debian/Ubuntu and Flatpak). The default output is
+~/Pictures/Wallpapers/WallpaperEngineVideos. Needs ffmpeg and ffprobe unless
+--no-optimize is used.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+
+WORKSHOP_SUFFIX = "steamapps/workshop/content/431960"
+STEAM_ROOTS = [
+    "~/.local/share/Steam",
+    "~/.steam/steam",
+    "~/.steam/debian-installation",
+    "~/.var/app/com.valvesoftware.Steam/.local/share/Steam",
+    "~/.var/app/com.valvesoftware.Steam/data/Steam",
+]
+DEFAULT_OUTPUT = "~/Pictures/Wallpapers/WallpaperEngineVideos"
+
+MAX_FPS = 60
+# Bits per pixel per frame. Well-made H.264 wallpapers sit around 0.05-0.15;
+# above this the file is far bigger (and slower to decode) than it needs to be.
+BLOATED_BPP = 0.30
+GOOD_PIX_FMTS = {"yuv420p", "yuvj420p"}
+MP4_AUDIO = {"aac", "mp3", "ac3", "eac3", "alac", "opus", "flac"}
+
+
+# --------------------------------------------------------------------------
+# Finding video wallpapers
+# --------------------------------------------------------------------------
+def find_workshop_folders():
+    found, seen = [], set()
+    for root in STEAM_ROOTS:
+        path = os.path.join(os.path.expanduser(root), WORKSHOP_SUFFIX)
+        if os.path.isdir(path):
+            real = os.path.realpath(path)
+            if real not in seen:
+                seen.add(real)
+                found.append(path)
+    return found
+
+
+def safe_filename(text):
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text).strip().strip(".")
+    return text or "untitled"
+
+
+def read_project(folder):
+    try:
+        with open(os.path.join(folder, "project.json"), encoding="utf-8-sig") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def video_wallpapers(workshop):
+    """Yields (workshop_id, title, video_path) for each video wallpaper."""
+    for wid in sorted(os.listdir(workshop)):
+        folder = os.path.join(workshop, wid)
+        if not os.path.isdir(folder):
+            continue
+        project = read_project(folder)
+        if not project or str(project.get("type", "")).lower() != "video":
+            continue
+        video = os.path.join(folder, str(project.get("file", "")))
+        if not project.get("file") or not os.path.isfile(video):
+            print(f"! {wid}: video file missing, skipped")
+            continue
+        yield wid, str(project.get("title") or wid), video
+
+
+# --------------------------------------------------------------------------
+# Inspecting a video
+# --------------------------------------------------------------------------
+def probe(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json",
+         "-show_format", "-show_streams", path],
+        capture_output=True, text=True)
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        return None
+
+
+def parse_rate(text):
+    try:
+        num, _, den = str(text).partition("/")
+        num, den = float(num), float(den or 1)
+        return num / den if den else 0.0
+    except ValueError:
+        return 0.0
+
+
+def is_faststart(path):
+    """True if the MP4 index ('moov') comes before the media data ('mdat')."""
+    try:
+        with open(path, "rb") as f:
+            while True:
+                head = f.read(8)
+                if len(head) < 8:
+                    return False
+                size, kind = struct.unpack(">I4s", head)
+                if kind == b"moov":
+                    return True
+                if kind == b"mdat":
+                    return False
+                if size == 1:
+                    size = struct.unpack(">Q", f.read(8))[0]
+                    f.seek(size - 16, 1)
+                elif size == 0:
+                    return False
+                else:
+                    f.seek(size - 8, 1)
+    except (OSError, struct.error):
+        return False
+
+
+class Plan:
+    def __init__(self):
+        self.reencode = []   # reasons that need a re-encode
+        self.remux = []      # reasons fixed by remuxing alone
+        self.only_bitrate = False
+        self.scale = False
+        self.fps_cap = False
+        self.deinterlace = False
+        self.copy_audio = True
+        self.has_audio = False
+        self.summary = ""
+
+
+def plan_for(path, info, want_1080p):
+    p = Plan()
+    streams = info.get("streams", [])
+    video = next((s for s in streams if s.get("codec_type") == "video"
+                  and not s.get("disposition", {}).get("attached_pic")), None)
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    if video is None:
+        p.reencode.append("no video stream found")
+        return p
+
+    codec = video.get("codec_name", "?")
+    w, h = int(video.get("width") or 0), int(video.get("height") or 0)
+    fps = parse_rate(video.get("avg_frame_rate")) or parse_rate(video.get("r_frame_rate"))
+    pix = video.get("pix_fmt", "")
+    rate = video.get("bit_rate") or info.get("format", {}).get("bit_rate")
+    bitrate = float(rate) if rate and str(rate).isdigit() else 0.0
+    p.summary = f"{codec} {w}x{h} {fps:.0f}fps {pix} {bitrate / 1e6:.1f} Mb/s"
+
+    if codec != "h264":
+        p.reencode.append(f"{codec} codec")
+    if pix and pix not in GOOD_PIX_FMTS:
+        p.reencode.append(f"{pix} color")
+    if fps > MAX_FPS + 0.5:
+        p.reencode.append(f"{fps:.0f} fps")
+        p.fps_cap = True
+    if video.get("field_order") not in (None, "", "progressive", "unknown"):
+        p.reencode.append("interlaced")
+        p.deinterlace = True
+    if want_1080p and (w > 1920 or h > 1080):
+        p.reencode.append(f"{w}x{h} > 1080p")
+        p.scale = True
+    if w and h and fps and bitrate:
+        bpp = bitrate / (w * h * min(fps, MAX_FPS))
+        if bpp > BLOATED_BPP:
+            p.reencode.append(f"bloated ({bitrate / 1e6:.0f} Mb/s)")
+            p.only_bitrate = len(p.reencode) == 1
+
+    if audio is not None:
+        p.has_audio = True
+        p.copy_audio = audio.get("codec_name") in MP4_AUDIO
+
+    fmt = info.get("format", {}).get("format_name", "")
+    if "mp4" not in fmt and "mov" not in fmt:
+        p.remux.append("not an MP4 file")
+    elif not is_faststart(path):
+        p.remux.append("not fast-start")
+    if p.has_audio and not p.copy_audio:
+        p.remux.append(f"{audio.get('codec_name')} audio")
+        p.copy_audio = False
+    return p
+
+
+# --------------------------------------------------------------------------
+# Writing the output
+# --------------------------------------------------------------------------
+def run_ffmpeg(args, dest):
+    tmp = dest + ".part.mp4"
+    try:
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args, tmp],
+                       check=True)
+    except (OSError, subprocess.CalledProcessError):
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    return tmp
+
+
+def audio_args(plan):
+    if not plan.has_audio:
+        return ["-an"]
+    return ["-c:a", "copy"] if plan.copy_audio else ["-c:a", "aac", "-b:a", "192k"]
+
+
+def remux(src, dest, plan):
+    return run_ffmpeg(["-i", src, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy",
+                       *audio_args(plan), "-movflags", "+faststart"], dest)
+
+
+def reencode(src, dest, plan, crf, preset):
+    filters = []
+    if plan.deinterlace:
+        filters.append("bwdif")
+    if plan.fps_cap:
+        filters.append(f"fps={MAX_FPS}")
+    if plan.scale:
+        filters.append("scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080")
+    filters.append("format=yuv420p")
+    return run_ffmpeg(["-i", src, "-map", "0:v:0", "-map", "0:a:0?",
+                       "-vf", ",".join(filters),
+                       "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+                       "-profile:v", "high", "-pix_fmt", "yuv420p",
+                       *audio_args(plan), "-movflags", "+faststart"], dest)
+
+
+def process(src, dest, a):
+    """Returns a short description of what was done."""
+    if not a.optimize:
+        shutil.copy2(src, dest)
+        return "copied"
+
+    info = probe(src)
+    if info is None:
+        shutil.copy2(src, dest)
+        return "copied (ffprobe couldn't read it)"
+    plan = plan_for(src, info, a.hd)
+
+    note = ""
+    if plan.reencode:
+        tmp = reencode(src, dest, plan, a.crf, a.preset)
+        if plan.only_bitrate and os.path.getsize(tmp) >= os.path.getsize(src):
+            os.remove(tmp)  # re-encoding didn't help; fall back to the original
+            note = " (re-encode wasn't smaller, kept the original)"
+        else:
+            os.replace(tmp, dest)
+            return f"re-encoded: {', '.join(plan.reencode)} [{plan.summary}]"
+
+    if plan.remux:
+        os.replace(remux(src, dest, plan), dest)
+        return f"remuxed: {', '.join(plan.remux)}{note}"
+
+    if note:
+        shutil.copy2(src, dest)
+        return "copied" + note
+
+    shutil.copy2(src, dest)
+    return "copied (already well encoded)"
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog=os.path.basename(sys.argv[0]),
+        description="Copy Wallpaper Engine video wallpapers into one folder, "
+                    "optimizing badly encoded ones.")
+    ap.add_argument("workshop", nargs="*",
+                    help="Workshop folder(s) (.../steamapps/workshop/content/431960); "
+                         "default: search the usual Steam locations")
+    ap.add_argument("-o", "--output", default=DEFAULT_OUTPUT,
+                    help=f"destination folder (default {DEFAULT_OUTPUT})")
+    ap.add_argument("--1080p", dest="hd", action="store_true",
+                    help="also shrink videos larger than 1920x1080 to 1080p")
+    ap.add_argument("--no-optimize", dest="optimize", action="store_false",
+                    help="copy every video exactly as it is")
+    ap.add_argument("--crf", type=int, default=18,
+                    help="H.264 quality for re-encodes, lower is better (default 18)")
+    ap.add_argument("--preset", default="veryfast",
+                    help="x264 preset for re-encodes; slower = smaller files (default veryfast)")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="redo videos that are already in the output folder")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="show what would be done without writing anything")
+    a = ap.parse_args()
+
+    if a.hd:
+        a.optimize = True
+    if a.optimize and not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        sys.exit("Optimizing needs ffmpeg and ffprobe. Install ffmpeg, "
+                 "or use --no-optimize to copy the videos as they are.")
+
+    workshops = a.workshop or find_workshop_folders()
+    if not workshops:
+        sys.exit("No Workshop folder found. Give its path, e.g. "
+                 f"~/.local/share/Steam/{WORKSHOP_SUFFIX}")
+
+    out = os.path.expanduser(a.output)
+    if not a.dry_run:
+        os.makedirs(out, exist_ok=True)
+
+    items = []
+    for ws in workshops:
+        if not os.path.isdir(ws):
+            sys.exit(f"Not a folder: {ws}")
+        print(f"Scanning {ws}")
+        items.extend(video_wallpapers(ws))
+
+    counts = {}
+    for _, title, _ in items:
+        key = safe_filename(title).lower()
+        counts[key] = counts.get(key, 0) + 1
+
+    done = skipped = failed = 0
+    for wid, title, src in items:
+        base = safe_filename(title)
+        if counts[base.lower()] > 1:
+            base = f"{base} ({wid})"
+        ext = ".mp4" if a.optimize else (os.path.splitext(src)[1] or ".mp4")
+        dest = os.path.join(out, base + ext)
+
+        if os.path.exists(dest) and not a.overwrite:
+            skipped += 1
+            continue
+
+        if a.dry_run:
+            if a.optimize:
+                info = probe(src)
+                plan = plan_for(src, info, a.hd) if info else None
+                if plan and plan.reencode:
+                    what = f"re-encode: {', '.join(plan.reencode)} [{plan.summary}]"
+                elif plan and plan.remux:
+                    what = f"remux: {', '.join(plan.remux)}"
+                else:
+                    what = "copy"
+            else:
+                what = "copy"
+            print(f"* {title} -> {os.path.basename(dest)}: would {what}")
+            done += 1
+            continue
+
+        print(f"* {title} -> {os.path.basename(dest)} ...", flush=True)
+        try:
+            print(f"  {process(src, dest, a)}")
+            done += 1
+        except (OSError, subprocess.CalledProcessError) as e:
+            print(f"! Failed: {title}: {e}")
+            failed += 1
+
+    verb = "Would process" if a.dry_run else "Processed"
+    print(f"\n{verb} {done}, skipped {skipped} already there"
+          + (f", {failed} failed" if failed else "") + f" -> {out}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -6,6 +6,7 @@ Command-line tools for unpacking, editing and repacking Wallpaper Engine scene w
 | --- | --- |
 | `wallpaper-engine-unpack` | Extracts `.pkg` files and converts `.tex` textures to PNG/JPG/GIF/MP4. A Python port of [RePKG](https://github.com/notscuffed/repkg). |
 | `wallpaper-engine-repack` | Packs an extracted folder back into a `scene.pkg`. |
+| `wallpaper-engine-copy-videos` | Copies every video wallpaper from the Workshop into one folder, named by title, re-encoding badly encoded ones and optionally shrinking them to 1080p. |
 | `wallpaper-engine-thumbnail-generator` | Makes a thumbnail (1920×1080 by default) named after the `project.json` title and points `"preview"` at it. |
 
 ## Install
@@ -84,6 +85,36 @@ wallpaper-engine-repack --all /home/$USER/Pictures/Wallpapers/Unpacked -u unpack
 ```
 
 Each folder ends up with `project.json`, the preview and `scene.pkg`, the same files a Workshop wallpaper has, ready for a player like Waywallen. The original package header version is saved in `.pkg-version` while unpacking and reused automatically. `-u` must match the subfolder name used when unpacking; `unpacked-scenes` is also the default, so it can be left out.
+
+## Copying Video Wallpapers
+
+Video wallpapers are plain video files, not packages, so they don't need unpacking. `wallpaper-engine-copy-videos` gathers them all into one folder as `.mp4` files, ready for a player like Waywallen, and fixes badly encoded ones on the way:
+
+```bash
+wallpaper-engine-copy-videos --dry-run                    # see what it would do
+wallpaper-engine-copy-videos -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos
+wallpaper-engine-copy-videos -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos --1080p
+```
+
+Each video is checked with `ffprobe`, and only what needs fixing gets fixed:
+
+| Problem | What happens |
+| --- | --- |
+| HEVC, VP9, AV1 or another codec that is heavy to decode | Re-encoded to H.264 |
+| 10-bit or 4:2:2 / 4:4:4 color | Re-encoded to standard 8-bit 4:2:0 |
+| Bitrate far above what the resolution needs | Re-encoded; if that doesn't make it smaller, the original is kept |
+| More than 60 frames per second | Re-encoded at 60 fps |
+| Interlaced | Deinterlaced and re-encoded |
+| Larger than 1920×1080 | Shrunk to 1080p, **only with `--1080p`** |
+| Not an MP4, or not "fast start" | Remuxed into a fast-start MP4, without re-encoding |
+| Nothing wrong | Copied as is |
+
+* With no folder given, it finds the Workshop folder in the usual Steam locations (native, Debian/Ubuntu and Flatpak). Give one or more Workshop folders to choose.
+* Each video is named after its wallpaper's title, such as `Rainy Night.mp4`; when two titles match, the Workshop ID is added.
+* Re-encodes use H.264 at `--crf 18` (lower is higher quality) with `--preset veryfast`; a slower preset such as `slow` makes smaller files but takes longer. Audio is kept, or converted to AAC if MP4 can't hold it.
+* A codec conversion can make a file slightly larger (VP9 and HEVC compress better than H.264), but H.264 is far lighter to play, which matters most on GPUs without hardware video decoding.
+* Running it again only processes new videos. `--overwrite` redoes the ones already there, for example to apply `--1080p` later. `--no-optimize` copies everything exactly as it is.
+* Needs `ffmpeg` and `ffprobe` with the `libx264` encoder (on Fedora, the full `ffmpeg` package from RPM Fusion).
 
 ## License
 
