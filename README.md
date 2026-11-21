@@ -95,7 +95,20 @@ Video wallpapers are plain video files, not packages, so they don't need unpacki
 * `wallpaper-engine-copy-videos` copies every video exactly as it is. Fast, and needs nothing but Python.
 * `wallpaper-engine-copy-videos-optimized` saves them as MP4 and fixes badly encoded ones on the way (see [Optimizing](#optimizing)). It needs `ffmpeg`.
 
-Both name each video after its wallpaper's title, such as `Rainy Night.mp4`, adding the Workshop ID when two titles match.
+Both copy each video wallpaper as a whole folder (its `project.json`, preview and any other files, with the video under its original file name) into a folder named after its title, adding the Workshop ID when two titles match:
+
+```
+/home/$USER/Pictures/Wallpapers/WallpaperEngineVideos/
+└── Rainy Night/
+    ├── project.json
+    ├── preview.jpg
+    └── rainy_night_loop.mp4
+```
+
+If optimizing changes a video's file type (such as `.webm` to `.mp4`), its `project.json` is updated to point at the new file.
+
+* `--waywallen` puts the folders in the Steam-style layout Waywallen's Wallpaper Engine plugin reads, `OUTPUT/steamapps/common/wallpaper_engine/projects/myprojects/<title>/`, so Waywallen shows each one with its title, preview and description. Add `OUTPUT` as a library under Plugins → Wallpaper Engine.
+* `--flat` writes only the videos, as `OUTPUT/<title>.mp4`, with no folders. Videos left by an earlier `--flat` run are moved into their folders by a later folder run, instead of being copied or re-encoded again.
 
 ```bash
 WS=~/.local/share/Steam/steamapps/workshop/content/431960
@@ -122,7 +135,7 @@ After subscribing to new wallpapers, run the same command again; only the new vi
 wallpaper-engine-copy-videos-optimized "$WS" -o /home/$USER/Pictures/Wallpapers/WallpaperEngineVideos --1080p --overwrite
 ```
 
-Copying unchanged keeps each video's original extension (`.mp4`, `.webm`, ...), while optimizing always writes `.mp4`. If you switch from one to the other, delete the old copies of any non-MP4 videos.
+Copying unchanged keeps each video's original file type (`.mp4`, `.webm`, ...), while optimizing writes `.mp4` whenever it changes a video.
 
 ### Optimizing
 

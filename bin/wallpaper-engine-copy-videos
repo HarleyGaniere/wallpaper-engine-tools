@@ -14,9 +14,17 @@ is called by:
             [--crf N] [--preset P] [--dry-run]
         Copies them as MP4, optimizing badly encoded ones along the way.
 
-Both find every wallpaper whose project.json says "type": "video" and name
-its video after the wallpaper's title ("Rainy Night.mp4"; the Workshop ID is
-added when two titles match).
+Both find every wallpaper whose project.json says "type": "video" and copy
+the whole wallpaper (project.json, preview, everything) into a folder named
+after its title, OUTPUT/<title>/, keeping the video's own file name; the
+Workshop ID is added when two titles match. If optimizing changes the video's
+extension (e.g. .webm to .mp4), project.json is updated to match.
+
+--waywallen puts the folders under OUTPUT/steamapps/common/wallpaper_engine/
+projects/myprojects/, where Waywallen's Wallpaper Engine plugin finds them.
+--flat writes only the videos, as OUTPUT/<title>.mp4, without folders. Video
+files left by an earlier --flat run are moved into their folders rather than
+being copied or re-encoded again.
 
 With -optimized, each video is checked with ffprobe and only re-encoded
 (to H.264, or HEVC with --hevc) when something is wrong with it:
@@ -58,6 +66,7 @@ STEAM_ROOTS = [
     "~/.var/app/com.valvesoftware.Steam/data/Steam",
 ]
 DEFAULT_OUTPUT = "~/Pictures/Wallpapers/WallpaperEngineVideos"
+WAYWALLEN_SUBDIR = "steamapps/common/wallpaper_engine/projects/myprojects"
 
 MAX_FPS = 60
 # "Bloated" thresholds in bits per pixel per frame (bitrate / (width x height x fps)).
@@ -315,6 +324,31 @@ def process(src, dest, plan, opts):
     return "copied" + (note or " (already well encoded)")
 
 
+def copy_wallpaper_files(src_dir, folder, skip):
+    """Copy everything in the wallpaper's folder except the video itself."""
+    os.makedirs(folder, exist_ok=True)
+    for name in os.listdir(src_dir):
+        if name == skip:
+            continue
+        src = os.path.join(src_dir, name)
+        dst = os.path.join(folder, name)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+
+
+def point_project_at(folder, video_name):
+    """Update project.json's "file" when the video's file name changed."""
+    path = os.path.join(folder, "project.json")
+    with open(path, encoding="utf-8-sig") as f:
+        project = json.load(f)
+    project["file"] = video_name
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(project, f, indent="\t", ensure_ascii=False)
+        f.write("\n")
+
+
 def human(n):
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024 or unit == "GB":
@@ -355,6 +389,10 @@ def main():
         ap.add_argument("--preset", default="veryfast",
                         help="encoder speed: slower presets (medium, slow) make smaller "
                              "files at the same quality but take longer (default veryfast)")
+    ap.add_argument("--waywallen", action="store_true",
+                    help=f"put the folders under OUTPUT/{WAYWALLEN_SUBDIR}/ for Waywallen")
+    ap.add_argument("--flat", action="store_true",
+                    help="write only the video files, OUTPUT/<title>.mp4, without folders")
     ap.add_argument("--overwrite", action="store_true",
                     help="redo videos that are already in the output folder")
     ap.add_argument("--dry-run", action="store_true",
@@ -382,7 +420,11 @@ def main():
         sys.exit("No Workshop folder found. Give its path, e.g. "
                  f"~/.local/share/Steam/{WORKSHOP_SUFFIX}")
 
+    if a.flat and a.waywallen:
+        ap.error("--flat and --waywallen can't be used together")
     out = os.path.expanduser(a.output)
+    if a.waywallen:
+        out = os.path.join(out, WAYWALLEN_SUBDIR)
     if not a.dry_run:
         os.makedirs(out, exist_ok=True)
 
@@ -404,39 +446,76 @@ def main():
         base = safe_filename(title)
         if counts[base.lower()] > 1:
             base = f"{base} ({wid})"
+        src_dir = os.path.dirname(src)
+        video_name = os.path.basename(src)
+        stem, src_ext = os.path.splitext(video_name)
+        src_ext = src_ext or ".mp4"
+
+        # Folder layout: <out>/<title>/ holds the whole wallpaper (project.json,
+        # preview, ...) with the video under its original name. --flat writes
+        # just <out>/<title>.mp4.
+        folder = None if a.flat else os.path.join(out, base)
+        if folder and not a.overwrite and any(
+                os.path.isfile(os.path.join(folder, stem + e)) for e in {".mp4", src_ext}):
+            skipped += 1
+            continue
 
         plan = None
         if optimized:
             info = probe(src)
             if info is not None:
                 plan = plan_for(src, info, a)
-        src_ext = os.path.splitext(src)[1] or ".mp4"
         changes = plan is not None and (plan.reencode or plan.remux)
-        dest = os.path.join(out, base + (".mp4" if changes else src_ext))
+        ext = ".mp4" if changes else src_ext
+        if folder:
+            dest = os.path.join(folder, stem + ext)
+        else:
+            dest = os.path.join(out, base + ext)
+            if os.path.exists(dest) and not a.overwrite:
+                skipped += 1
+                continue
 
-        if os.path.exists(dest) and not a.overwrite:
-            skipped += 1
-            continue
+        # An earlier --flat run's <out>/<title>.mp4 can be moved into the new
+        # folder instead of being copied or re-encoded again.
+        legacy = None
+        if folder and not a.overwrite:
+            for where in (out, os.path.expanduser(a.output)):
+                for candidate in (base + ".mp4", base + src_ext):
+                    path = os.path.join(where, candidate)
+                    if legacy is None and os.path.isfile(path):
+                        legacy = path
+                        dest = os.path.join(folder, stem + os.path.splitext(candidate)[1])
 
+        shown = os.path.relpath(dest, out)
         if a.dry_run:
-            if plan and plan.reencode:
+            if legacy:
+                what = f"move existing {os.path.basename(legacy)} into the folder"
+            elif plan and plan.reencode:
                 what = f"re-encode to {a.codec.upper()}: {', '.join(plan.reencode)} [{plan.summary}]"
             elif plan and plan.remux:
                 what = f"remux: {', '.join(plan.remux)}"
             else:
                 what = "copy"
-            print(f"* {title} -> {os.path.basename(dest)}: would {what}")
+            print(f"* {title} -> {shown}: would {what}")
             done += 1
             continue
 
-        print(f"* {title} -> {os.path.basename(dest)} ...", flush=True)
+        print(f"* {title} -> {shown} ...", flush=True)
         try:
-            result = process(src, dest, plan, a)
+            if folder:
+                copy_wallpaper_files(src_dir, folder, skip=video_name)
+            if legacy:
+                os.replace(legacy, dest)
+                result = f"moved existing {os.path.basename(legacy)} into the folder"
+            else:
+                result = process(src, dest, plan, a)
+            if folder and os.path.basename(dest) != video_name:
+                point_project_at(folder, os.path.basename(dest))
             size_in += os.path.getsize(src)
             size_out += os.path.getsize(dest)
             print(f"  {result}  ({human(os.path.getsize(src))} -> {human(os.path.getsize(dest))})")
             done += 1
-        except (OSError, subprocess.CalledProcessError) as e:
+        except (OSError, subprocess.CalledProcessError, ValueError) as e:
             print(f"! Failed: {title}: {e}")
             failed += 1
 
